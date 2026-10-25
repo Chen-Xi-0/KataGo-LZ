@@ -5,9 +5,24 @@
 #include "../core/makedir.h"
 #include "../core/fileutils.h"
 #include "../neuralnet/nninterface.h"
+#include "../neuralnet/nneval.h"
 #include "../search/patternbonustable.h"
 
 using namespace std;
+
+//LZ ladder correction v5 parameters (see nneval.h). Only effective for LZ models.
+static void loadLzLadderParams(ConfigParser& cfg) {
+  LzLadder::Params& p = LzLadder::params;
+  if(cfg.contains("lzLadderEnabled")) p.enabled = cfg.getBool("lzLadderEnabled");
+  if(cfg.contains("lzLadderMinStones")) p.minStones = cfg.getInt("lzLadderMinStones",1,361);
+  if(cfg.contains("lzLadderValueBlend")) p.valueBlend = cfg.getDouble("lzLadderValueBlend",0.0,1.0);
+  if(cfg.contains("lzLadderMaxPlies")) p.maxPlies = cfg.getInt("lzLadderMaxPlies",2,400);
+  if(cfg.contains("lzLadderCheckNodes")) p.checkNodes = cfg.getInt("lzLadderCheckNodes",1,362);
+  if(cfg.contains("lzLadderMinPolicy")) p.minPolicy = cfg.getDouble("lzLadderMinPolicy",1e-9,1.0);
+  if(cfg.contains("lzLadderPolicyFactor")) p.policyFactor = cfg.getDouble("lzLadderPolicyFactor",1e-6,1.0);
+  if(cfg.contains("lzLadderPenaltyBase")) p.penaltyRank = cfg.getInt("lzLadderPenaltyBase",0,361);
+  if(cfg.contains("lzLadderChaseStones")) p.chaseStones = cfg.getInt("lzLadderChaseStones",1,361);
+}
 
 void Setup::initializeSession(ConfigParser& cfg) {
   (void)cfg;
@@ -101,6 +116,8 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
   vector<NNEvaluator*> nnEvals;
   testAssert(nnModelNames.size() == nnModelFiles.size());
   testAssert(expectedSha256s.size() == 0 || expectedSha256s.size() == nnModelFiles.size());
+
+  loadLzLadderParams(cfg);
 
   #if defined(USE_CUDA_BACKEND)
   string backendPrefix = "cuda";

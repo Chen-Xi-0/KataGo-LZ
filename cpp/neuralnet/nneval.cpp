@@ -1111,29 +1111,200 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
 }
 
 //-------------------------------------------------------------------------------------
-//LZ0 ladder correction: Leela Zero-style inputs (V8) have no ladder feature planes, so the policy
-//head is blind to ladders. Patch the policy in place with KataGo's rule-based bounded ladder solver:
-//boost capture moves against opponent groups proven capturable, and demote our own moves that leave
-//an adjacent friendly group in an inescapable capture or that atari a group that simply runs away.
+//LZ0 ladder correction v5: Leela Zero-style inputs (V8) have no ladder feature planes, so
+//both the policy and the value head are blind to ladders. Instead of hand-tuned penalties:
+//  - KataGo's rule-based solver provides exact verdicts (which two-liberty groups are
+//    capturable / escapable) and the chase moves;
+//  - for a proven-capturable big group the ladder line is played out on the board and the
+//    RESOLVED position is evaluated with the SAME net - after the capture the stones are
+//    simply gone, so even a ladder-blind net reads the material correctly. That winrate,
+//    blended back in, replaces every hand-tuned penalty magnitude (design doc: 05_验证输出/
+//    征子修正v3_对齐参考实现设计_20261025.md, v5 section);
+//  - policy surgery keeps the reference fork's mild semantics: demote moves that leave a
+//    solver-dead group (just below the 3rd-ranked move, probability factor 0.9) and zero
+//    futile chases of solver-alive groups. No boost.
 //Only used for LZ models; native KataGo nets are unaffected.
 
-static constexpr float LZ_LADDER_BOOST_FACTOR = 2.0f;
-static constexpr int LZ_LADDER_CANDIDATE_LIMIT = 10;
-static constexpr float LZ_LADDER_MIN_CANDIDATE_PRIOR = 5e-4f;
+namespace LzLadder {
+  Params params;
+  Params::Params()
+    : enabled(true), minStones(3), valueBlend(0.8), maxPlies(40),
+      checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4) {}
+}
 
-//Runs on the raw policy logits, before the legality filter and softmax. Because the values are
-//logits rather than probabilities, "demote" means subtracting a large-enough constant that the
-//move's probability becomes negligible while staying finite, and "boost" means adding a constant
-//that lifts the move near the top of the distribution. The subsequent softmax renormalizes, so
-//the output always sums to 1.
+//The value override lives one level up (evaluateWithLzLadder): calling evaluate() from inside
+//the postprocessing of evaluate() deadlocks on the evaluator's internal locking, so the ladder
+//end-position must be evaluated as a clean sequential call after the main eval returns.
+
+//Play out the canonical ladder line on a solver-proven capturable two-liberty group.
+//The attacker (to move on startBoard) ataris via a solver working move that keeps the chase
+//alive; the defender answers by extending at the group's last liberty. Every attacker step
+//is re-certified by the solver, so the line can never diverge from a proven-capture path.
+//Returns true with endBoard/endHist set to the position after the capture (defender to move).
+//Limitation (documented in the design doc): the defender's counter-atari alternatives are
+//not simulated - the verdict is still exact (the solver proved capture against any defense),
+//only the precise end board may differ from the defender's best counter-play.
+static bool expandLadderLine(
+  const Board& startBoard, const BoardHistory& startHist, Player attacker, Loc groupLoc,
+  int maxPlies, Board& endBoard, BoardHistory& endHist
+) {
+  const Player defender = getOpp(attacker);
+  vector<Loc> buf;
+  vector<Loc> workingMoves;
+  static const int NDX[4] = {1,-1,0,0};
+  static const int NDY[4] = {0,0,1,-1};
+  endBoard = startBoard;
+  endHist = startHist;
+
+  for(int plies = 0; plies < maxPlies; plies++) {
+    const int curLibs = endBoard.getNumLiberties(groupLoc);
+    if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
+      std::fprintf(stderr, "[LADX] ply=%d libs=%d\n", plies, curLibs);
+    if(curLibs == 0)
+      return false; //already captured: line no longer canonical
+    if(curLibs == 1) {
+      //Attacker to move on an atari'd group (the defender's last extension gained nothing):
+      //play the capture. Self-verifying: try every empty neighbor of every chain stone and
+      //accept only a move that actually removes the group from the board.
+      Loc head = endBoard.chain_head[groupLoc];
+      for(int y = 0; y < endBoard.y_size; y++) {
+        for(int x = 0; x < endBoard.x_size; x++) {
+          if(endBoard.chain_head[Location::getLoc(x,y,endBoard.x_size)] != head)
+            continue;
+          for(int d = 0; d<4; d++) {
+            int nx = x + NDX[d];
+            int ny = y + NDY[d];
+            if(nx < 0 || nx >= endBoard.x_size || ny < 0 || ny >= endBoard.y_size)
+              continue;
+            Loc nb = Location::getLoc(nx,ny,endBoard.x_size);
+            if(endBoard.colors[nb] != C_EMPTY)
+              continue;
+            Board t2(endBoard);
+            BoardHistory h2(endHist);
+            if(!h2.makeBoardMoveTolerant(t2, nb, attacker))
+              continue;
+            if(t2.colors[groupLoc] == C_EMPTY) {
+              endBoard = t2;
+              endHist = h2;
+              return true;
+            }
+          }
+        }
+      }
+      if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
+        std::fprintf(stderr, "[LADX] ply=%d no-capture-move-worked\n", plies);
+      return false;
+    }
+    if(curLibs != 2)
+      return false; //escaped shape: line no longer canonical
+
+    //Attacker: pick a working move whose atari keeps the group captured-even-defending.
+    if(!endBoard.searchIsLadderCapturedAttackerFirst2Libs(groupLoc, buf, workingMoves)) {
+      if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
+        std::fprintf(stderr, "[LADX] ply=%d solver-refused\n", plies);
+      return false;
+    }
+    if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
+      std::fprintf(stderr, "[LADX] ply=%d wm=%zu\n", plies, workingMoves.size());
+    bool played = false;
+    for(Loc m: workingMoves) {
+      Board trial(endBoard);
+      BoardHistory trialHist(endHist);
+      if(!trialHist.makeBoardMoveTolerant(trial, m, attacker))
+        continue;
+      if(trial.getNumLiberties(groupLoc) != 1)
+        continue;
+      if(trial.searchIsLadderCaptured(groupLoc, true, buf)) {
+        endBoard = trial;
+        endHist = trialHist;
+        played = true;
+        break;
+      }
+    }
+    if(!played) {
+      if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
+        std::fprintf(stderr, "[LADX] ply=%d no-working-move-accepted\n", plies);
+      return false;
+    }
+
+    //Defender: extend at the group's last liberty (the ladder continuation). Self-verifying
+    //like the capture branch: try each empty chain-neighbor as the extension, and if none is
+    //legal for the defender, fall through to the attacker capture that ends the ladder.
+    {
+      Loc head = endBoard.chain_head[groupLoc];
+      bool extended = false;
+      for(int y = 0; y < endBoard.y_size && !extended; y++) {
+        for(int x = 0; x < endBoard.x_size && !extended; x++) {
+          if(endBoard.chain_head[Location::getLoc(x,y,endBoard.x_size)] != head)
+            continue;
+          for(int d = 0; d<4; d++) {
+            int nx = x + NDX[d];
+            int ny = y + NDY[d];
+            if(nx < 0 || nx >= endBoard.x_size || ny < 0 || ny >= endBoard.y_size)
+              continue;
+            Loc nb = Location::getLoc(nx,ny,endBoard.x_size);
+            if(endBoard.colors[nb] != C_EMPTY)
+              continue;
+            Board trial(endBoard);
+            BoardHistory trialHist(endHist);
+            if(trialHist.makeBoardMoveTolerant(trial, nb, defender)) {
+              const int extLibs = trial.getNumLiberties(nb);
+              if(extLibs >= 3)
+                continue; //not the ladder liberty or breaks out: keep looking
+              endBoard = trial;
+              endHist = trialHist;
+              groupLoc = nb; //follow the extended chain
+              extended = true;
+              break;
+            }
+          }
+        }
+      }
+      if(extended)
+        continue; //next ply: attacker moves again
+
+      //No legal extension (suicide etc.): the attacker captures at a liberty, ladder ends.
+      for(int y = 0; y < endBoard.y_size; y++) {
+        for(int x = 0; x < endBoard.x_size; x++) {
+          if(endBoard.chain_head[Location::getLoc(x,y,endBoard.x_size)] != head)
+            continue;
+          for(int d = 0; d<4; d++) {
+            int nx = x + NDX[d];
+            int ny = y + NDY[d];
+            if(nx < 0 || nx >= endBoard.x_size || ny < 0 || ny >= endBoard.y_size)
+              continue;
+            Loc nb = Location::getLoc(nx,ny,endBoard.x_size);
+            if(endBoard.colors[nb] != C_EMPTY)
+              continue;
+            Board t2(endBoard);
+            BoardHistory h2(endHist);
+            if(!h2.makeBoardMoveTolerant(t2, nb, attacker))
+              continue;
+            if(t2.colors[groupLoc] == C_EMPTY) {
+              endBoard = t2;
+              endHist = h2;
+              return true;
+            }
+          }
+        }
+      }
+      if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
+        std::fprintf(stderr, "[LADX] ply=%d defender-branch-dead-end\n", plies);
+      return false;
+    }
+  }
+  return false;
+}
+
+//Runs on the raw policy logits, before the softmax; the legality mask is already in place,
+//so demotions keep the output a valid distribution after renormalization. Policy surgery
+//only - the value override is done by evaluateWithLzLadder one level up.
 //
-//Coordinate note: fillRowV8 writes the LZ-style planes bottom-origin, but this function works in
-//KataGo's board coordinates via NNPos::posToLoc / locToPos, which are top-origin. The pos<->loc
-//mapping is therefore self-consistent here (both directions go through the same helpers), and no
-//extra flip is needed.
-static constexpr float LZ_LADDER_DEMOTE_LOGIT = 30.0f;
-
-static void applyLZLadderLogitCorrection(
+//Coordinate note: fillRowV8 writes the LZ-style planes bottom-origin, but this function works
+//in KataGo's board coordinates via NNPos::posToLoc / locToPos, which are top-origin. The
+//pos<->loc mapping is therefore self-consistent here (both directions go through the same
+//helpers), and no extra flip is needed.
+static void applyLZLadderCorrectionV5(
   const Board& board,
   const BoardHistory& history,
   Player nextPlayer,
@@ -1142,6 +1313,7 @@ static void applyLZLadderLogitCorrection(
   float* policy,
   const bool* isLegal
 ) {
+  const LzLadder::Params& P = LzLadder::params;
   const int policySize = NNPos::getPolicySize(nnXLen,nnYLen);
 
   float maxLogit = -1e25f;
@@ -1155,68 +1327,13 @@ static void applyLZLadderLogitCorrection(
     return;
 
   const bool suicideLegal = history.rules.multiStoneSuicideLegal;
-
   static const int NDX[4] = {1,-1,0,0};
   static const int NDY[4] = {0,0,1,-1};
   vector<Loc> buf;
 
-  //(a) Boost moves that start a winning ladder, in the manner of LZ's LadderDetection: playing
-  //the move must capture nothing, leave the target group in atari, and that group must remain
-  //ladder-doomed even with the defender moving first (LZ's IsLadderEscape < 0). The raw solver
-  //proof ("this two-liberty group can be captured") also covers ordinary short-range tactics
-  //where the defender escapes by extending; boosting those fires all over complex positions and
-  //scrambles the midgame policy, so each working move is verified on the board before boosting.
-  NNInputs::iterateLadderGroups(board, [&](Loc loc, int libs, bool captured, const vector<Loc>& workingMoves) {
-    if(!captured || libs != 2)
-      return;
-    Color stone = board.colors[loc];
-    if(stone == C_EMPTY || stone == nextPlayer)
-      return;
-    const float boostTo = maxLogit + std::log(LZ_LADDER_BOOST_FACTOR);
-    for(Loc m: workingMoves) {
-      if(!board.isLegal(m,nextPlayer,suicideLegal))
-        continue;
-      int pos = NNPos::locToPos(m,board.x_size,nnXLen,nnYLen);
-      if(pos < 0 || pos >= policySize)
-        continue;
-      if(!isLegal[pos])
-        continue;
-      Board copy(board);
-      if(!copy.playMove(m,nextPlayer,suicideLegal))
-        continue;
-      //LZ requires the move to capture nothing (capture_count == 0).
-      if(nextPlayer == P_WHITE
-         ? copy.numWhiteCaptures != board.numWhiteCaptures
-         : copy.numBlackCaptures != board.numBlackCaptures)
-        continue;
-      //Kos make the ladder verdict unreliable (the recapture might be illegal), so skip them.
-      if(copy.ko_loc != Board::NULL_LOC)
-        continue;
-      //The target group must now be in atari, and remain ladder-doomed with the defender to move.
-      bool ladderDoomed = false;
-      const int mx = Location::getX(m,board.x_size);
-      const int my = Location::getY(m,board.x_size);
-      for(int d = 0; d<4 && !ladderDoomed; d++) {
-        const int nx = mx + NDX[d];
-        const int ny = my + NDY[d];
-        if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
-          continue;
-        Loc nb = Location::getLoc(nx,ny,board.x_size);
-        if(copy.colors[nb] != stone)
-          continue;
-        if(copy.getNumLiberties(nb) != 1)
-          continue;
-        if(copy.searchIsLadderCaptured(nb,true,buf))
-          ladderDoomed = true;
-      }
-      if(!ladderDoomed)
-        continue;
-      if(boostTo > policy[pos])
-        policy[pos] = boostTo;
-    }
-  });
-
-  //(b) Check the most promising own moves for ladder safety and for failed chases.
+  //Policy surgery on the top candidates: mild rank demotion for moves that leave a
+  //solver-dead own group, zeroing for futile chases of solver-alive groups. No boost - the
+  //reference fork (leela-zero-ladder) has none, and the value override carries the magnitude.
   vector<pair<float,int>> candidates;
   candidates.reserve(policySize);
   for(int pos = 0; pos<policySize; pos++) {
@@ -1229,17 +1346,20 @@ static void applyLZLadderLogitCorrection(
   if(candidates.empty())
     return;
 
-  int numCandidates = std::min((int)candidates.size(), LZ_LADDER_CANDIDATE_LIMIT);
+  int numCandidates = std::min((int)candidates.size(), P.checkNodes);
   std::partial_sort(
     candidates.begin(), candidates.begin() + numCandidates, candidates.end(),
     [](const pair<float,int>& a, const pair<float,int>& b) { return a.first > b.first; }
   );
 
+  //Demotion target: drop just below the penaltyRank-th ranked move (probability factor
+  //applied in log space, which the subsequent softmax preserves exactly).
+  float refLogit = candidates[std::min((size_t)P.penaltyRank, candidates.size()-1)].first;
+  const float demoteLogit = refLogit + std::log((float)P.policyFactor);
+
   for(int i = 0; i<numCandidates; i++) {
     const float logit = candidates[i].first;
-    //Candidate priors were tuned for probabilities; compare in log space against the same
-    //threshold so the shortlist is unchanged.
-    if(logit < maxLogit + std::log(LZ_LADDER_MIN_CANDIDATE_PRIOR))
+    if(logit < maxLogit + std::log((float)P.minPolicy))
       break;
     const int pos = candidates[i].second;
     Loc moveLoc = NNPos::posToLoc(pos,board.x_size,board.y_size,nnXLen,nnYLen);
@@ -1257,11 +1377,7 @@ static void applyLZLadderLogitCorrection(
       if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
         continue;
       Loc nb = Location::getLoc(nx,ny,board.x_size);
-      Color c0 = board.colors[nb];
-      if(c0 == C_EMPTY)
-        continue;
-      const int libs0 = board.getNumLiberties(nb);
-      if(libs0 <= 2)
+      if(board.colors[nb] != C_EMPTY && board.getNumLiberties(nb) <= 2)
         nearAtari = true;
     }
     if(!nearAtari)
@@ -1274,7 +1390,12 @@ static void applyLZLadderLogitCorrection(
     if(copy.ko_loc != Board::NULL_LOC)
       continue;
 
+    const int captured = nextPlayer == P_WHITE
+      ? (int)(copy.numWhiteCaptures - board.numWhiteCaptures)
+      : (int)(copy.numBlackCaptures - board.numBlackCaptures);
+
     bool defenseFail = false;
+    bool chaseFail = false;
 
     Loc checkedHeads[4];
     int numChecked = 0;
@@ -1301,23 +1422,29 @@ static void applyLZLadderLogitCorrection(
       if(postLibs > 2)
         continue;
       if(col == nextPlayer) {
-        //Our own group would still be captured with the opponent moving first. LZ gates this on
-        //the group having exactly two liberties and being larger than what the move captures
-        //(stone_count > capture_count); KataGo's solver returns only a verdict, so mirror the
-        //liberty count and stone-count side of the test to avoid demoting on shallow ataris.
-        if(postLibs == 2 && copy.getChainSize(nb) > 1) {
-          if(copy.searchIsLadderCaptured(nb,false,buf))
+        //Our move leaves an own two-liberty group that the opponent, moving next, can
+        //ladder-capture (the fork's IsLadderEscape verdict, boolean form). The fork also
+        //requires stone_count > capture_count so capturing connections are not demoted.
+        if(postLibs == 2 && copy.getChainSize(nb) > captured) {
+          vector<Loc> wm;
+          if(copy.searchIsLadderCapturedAttackerFirst2Libs(nb,buf,wm))
             defenseFail = true;
         }
       }
-      //No chase-fail demotion: LZ only penalizes chases proven futile at depth >= 8 plies
-      //(IsLadderChase >= cfg_ladder_offense), which the boolean KataGo solver cannot measure.
-      //Demoting every atari of an escaping group fires on ordinary sente ataris all over
-      //complex positions and scrambles the midgame policy.
+      else {
+        //Our move ataris (captures nothing) a big opponent group that escapes even with the
+        //defender moving first: a futile chase (the fork's IsLadderChase verdict).
+        if(captured == 0 && postLibs == 1 && copy.getChainSize(nb) >= P.chaseStones) {
+          if(!copy.searchIsLadderCaptured(nb,true,buf))
+            chaseFail = true;
+        }
+      }
     }
 
     if(defenseFail)
-      policy[pos] -= LZ_LADDER_DEMOTE_LOGIT;
+      policy[pos] = demoteLogit;
+    else if(chaseFail)
+      policy[pos] = -1e30f;
   }
 }
 
@@ -1484,11 +1611,12 @@ void NNEvaluator::evaluate(
 
     testAssert(legalCount > 0);
 
-    //LZ0 ladder-blindness correction. Applied to the scaled logits, before the softmax, so the
-    //legality mask is already in place and the renormalization that follows keeps the output a
-    //valid distribution. Native KataGo nets are unaffected.
-    if(isLZModelFlag)
-      applyLZLadderLogitCorrection(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal);
+    //LZ0 ladder correction v5, policy part: solver-verdict demotions on the scaled logits
+    //(before the softmax, legality mask in place). The value override happens one level up in
+    //evaluateWithLzLadder. Native KataGo nets unaffected.
+    //LZ_NO_LADDER=1 skips it entirely (A/B experiment switch for strength testing).
+    if(isLZModelFlag && LzLadder::params.enabled && getenv("LZ_NO_LADDER") == NULL)
+      applyLZLadderCorrectionV5(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal);
 
     //The correction can change which logit is the largest, so recompute the softmax reference.
     maxPolicy = -1e25f;
@@ -1776,6 +1904,94 @@ void NNEvaluator::evaluate(
   if(nnCacheTable != NULL)
     nnCacheTable->set(buf.result);
 
+}
+
+//v5 LZ ladder value override, search-facing wrapper: after the ordinary evaluate() returns,
+//look for a solver-proven capturable two-liberty group of the opponent's with ourselves to
+//move (attacker first). If one exists, play the ladder out on the board and evaluate the
+//RESOLVED position with the same net as a clean sequential call (evaluating from inside the
+//postprocessing of evaluate() would deadlock), then blend that winrate into this result.
+//After the capture the stones are simply off the board, so even a ladder-blind value head
+//reads the material - the magnitude always comes from the net itself, never a constant.
+void NNEvaluator::evaluateWithLzLadder(
+  const Board& board,
+  const BoardHistory& history,
+  Player nextPlayer,
+  const SGFMetadata* sgfMeta,
+  const MiscNNInputParams& nnInputParams,
+  NNResultBuf& buf,
+  bool skipCache,
+  bool includeOwnerMap
+) {
+  evaluate(board, history, nextPlayer, sgfMeta, nnInputParams, buf, skipCache, includeOwnerMap);
+
+  if(getenv("LZ_LADDER_DEBUG") != NULL) {
+    static std::atomic<int> dbgEntry(0);
+    if(dbgEntry.load() < 10) {
+      dbgEntry.fetch_add(1);
+      std::fprintf(stderr, "[LADE] wrapper isLZ=%d enabled=%d noLadEnv=%d ko=%d\n",
+        (int)isLZModelFlag, (int)LzLadder::params.enabled,
+        (int)(getenv("LZ_NO_LADDER") != NULL), (int)board.ko_loc);
+    }
+  }
+
+  if(!isLZModelFlag || !LzLadder::params.enabled || getenv("LZ_NO_LADDER") != NULL)
+    return;
+  if(buf.result == NULL)
+    return;
+  //Kos make ladder verdicts unreliable (the recapture might be illegal), so skip them.
+  if(board.ko_loc != Board::NULL_LOC)
+    return;
+
+  const LzLadder::Params& P = LzLadder::params;
+  float endWhiteWin = -1.0f;
+  NNInputs::iterateLadderGroups(board, [&](Loc loc, int libs, bool captured, const vector<Loc>&) {
+    if(getenv("LZ_LADDER_DEBUG") != NULL) {
+      static std::atomic<int> dbgCount(0);
+      if(dbgCount.load() < 30) {
+        dbgCount.fetch_add(1);
+        std::fprintf(stderr, "[LADG] loc=(%d,%d) libs=%d captured=%d size=%d color=%d nextPla=%d\n",
+          Location::getX(loc,board.x_size), Location::getY(loc,board.x_size),
+          libs, (int)captured, board.getChainSize(loc), (int)board.colors[loc], (int)nextPlayer);
+      }
+    }
+    if(endWhiteWin >= 0.0f)
+      return; //first resolved ladder wins
+    if(libs != 2 || !captured)
+      return;
+    Color stone = board.colors[loc];
+    if(stone == C_EMPTY || stone == nextPlayer)
+      return;
+    if(board.getChainSize(loc) < P.minStones)
+      return;
+    Board endBoard;
+    BoardHistory endHist(history);
+    if(!expandLadderLine(board, history, nextPlayer, loc, P.maxPlies, endBoard, endHist))
+      return;
+    //Deterministic symmetry; cache enabled - the search will often want this exact resolved
+    //position next, so the extra eval is not wasted.
+    MiscNNInputParams endParams = nnInputParams;
+    endParams.symmetry = 0;
+    NNResultBuf endBuf;
+    try {
+      evaluate(endBoard, endHist, endHist.presumedNextMovePla, sgfMeta, endParams, endBuf, false, false);
+      endWhiteWin = endBuf.result->whiteWinProb;
+    }
+    catch(const std::exception&) {
+      //Never let the correction break an eval; the value simply stays uncorrected.
+    }
+  });
+
+  if(endWhiteWin >= 0.0f) {
+    float blend = (float)P.valueBlend;
+    float blended = (1.0f - blend) * buf.result->whiteWinProb + blend * endWhiteWin;
+    if(getenv("LZ_LADDER_DEBUG") != NULL)
+      std::fprintf(stderr, "[LADV] override raw=%.4f end=%.4f -> %.4f\n",
+        buf.result->whiteWinProb, endWhiteWin, blended);
+    buf.result->whiteWinProb = blended;
+    //LZ nets report no noResult, so the win/loss pair stays a valid distribution.
+    buf.result->whiteLossProb = 1.0f - blended - buf.result->whiteNoResultProb;
+  }
 }
 
 // Uncomment this to lower the effective hash size down to one where we get true collisions
