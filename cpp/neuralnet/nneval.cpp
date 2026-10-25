@@ -1128,9 +1128,8 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
 namespace LzLadder {
   Params params;
   Params::Params()
-    : enabled(true), minStones(1), valueBlend(0.8), maxPlies(40),
-      checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
-      boostPolicy(2.0), boostWinrate(0.3) {}
+    : enabled(true), minStones(3), valueBlend(0.8), maxPlies(40),
+      checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4) {}
 }
 
 //The value override lives one level up (evaluateWithLzLadder): calling evaluate() from inside
@@ -1312,8 +1311,7 @@ static void applyLZLadderCorrectionV5(
   int nnXLen,
   int nnYLen,
   float* policy,
-  const bool* isLegal,
-  int* outBoostPos
+  const bool* isLegal
 ) {
   const LzLadder::Params& P = LzLadder::params;
   const int policySize = NNPos::getPolicySize(nnXLen,nnYLen);
@@ -1395,38 +1393,6 @@ static void applyLZLadderCorrectionV5(
     const int captured = nextPlayer == P_WHITE
       ? (int)(copy.numWhiteCaptures - board.numWhiteCaptures)
       : (int)(copy.numBlackCaptures - board.numBlackCaptures);
-
-    //Winning ladder-capture boost (shipped-fork semantics): a candidate that captures
-    //nothing, puts an adjacent opponent group into atari, and that group stays captured
-    //even with the defender moving first, is a winning ladder start. Promote the move to
-    //the top candidate's logit plus log(boostPolicy) - the softmax that follows preserves
-    //exactly the fork's policy[0]*factor probability promotion. The winrate side
-    //(proportional to the boosted prior, never a flat position change) is applied after
-    //the softmax, by the caller via *outBoostPos.
-    if(captured == 0 && (P.boostPolicy > 0.0 || P.boostWinrate > 0.0)) {
-      bool winningLadder = false;
-      for(int d = 0; d<4 && !winningLadder; d++) {
-        const int nx = x + NDX[d];
-        const int ny = y + NDY[d];
-        if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
-          continue;
-        Loc nb = Location::getLoc(nx,ny,board.x_size);
-        if(copy.colors[nb] != getOpp(nextPlayer))
-          continue;
-        if(copy.getNumLiberties(nb) != 1)
-          continue;
-        if(copy.searchIsLadderCaptured(nb,true,buf))
-          winningLadder = true;
-      }
-      if(winningLadder) {
-        const float promoted = candidates[0].first + (float)std::log(P.boostPolicy);
-        if(promoted > policy[pos])
-          policy[pos] = promoted;
-        if(outBoostPos != NULL && *outBoostPos < 0)
-          *outBoostPos = pos;
-        continue;
-      }
-    }
 
     bool defenseFail = false;
     bool chaseFail = false;
@@ -1645,14 +1611,12 @@ void NNEvaluator::evaluate(
 
     testAssert(legalCount > 0);
 
-    //LZ0 ladder correction v5, policy part: solver-verdict demotions and the
-    //winning-ladder-capture boost on the scaled logits (before the softmax, legality mask
-    //in place). The value override happens one level up in evaluateWithLzLadder; the
-    //boost's winrate nudge is applied after the value finalization below.
+    //LZ0 ladder correction v5, policy part: solver-verdict demotions on the scaled logits
+    //(before the softmax, legality mask in place). The value override happens one level up in
+    //evaluateWithLzLadder. Native KataGo nets unaffected.
     //LZ_NO_LADDER=1 skips it entirely (A/B experiment switch for strength testing).
-    int lzLadderBoostPos = -1;
     if(isLZModelFlag && LzLadder::params.enabled && getenv("LZ_NO_LADDER") == NULL)
-      applyLZLadderCorrectionV5(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal,&lzLadderBoostPos);
+      applyLZLadderCorrectionV5(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal);
 
     //The correction can change which logit is the largest, so recompute the softmax reference.
     maxPolicy = -1e25f;
@@ -1896,24 +1860,6 @@ void NNEvaluator::evaluate(
         buf.result->whiteLead = -(float)lead;
       }
 
-      //Winning-ladder-capture boost, winrate side (shipped-fork semantics): nudge the
-      //mover's winrate by wr * boostedPrior * boostWinrate - always proportional to the
-      //boosted move's own (now softmax-normalized) prior, never a flat position change.
-      //LZ nets report no noResult, so the win/loss pair stays a valid distribution.
-      if(isLZModelFlag && lzLadderBoostPos >= 0 && LzLadder::params.boostWinrate > 0.0) {
-        const float boostedPrior = policy[lzLadderBoostPos];
-        if(nextPlayer == P_WHITE) {
-          float wr = buf.result->whiteWinProb;
-          buf.result->whiteWinProb = std::min(1.0f, wr + wr * boostedPrior * (float)LzLadder::params.boostWinrate);
-        }
-        else {
-          float wr = 1.0f - buf.result->whiteWinProb;
-          float newWr = std::min(1.0f, wr + wr * boostedPrior * (float)LzLadder::params.boostWinrate);
-          buf.result->whiteWinProb = 1.0f - newWr;
-        }
-        buf.result->whiteLossProb = 1.0f - buf.result->whiteWinProb - buf.result->whiteNoResultProb;
-      }
-
       if(modelVersion >= 9) {
         buf.result->varTimeLeft = (float)varTimeLeft;
         buf.result->shorttermWinlossError = (float)shorttermWinlossError;
@@ -2011,13 +1957,6 @@ void NNEvaluator::evaluateWithLzLadder(
     }
     if(endWhiteWin >= 0.0f)
       return; //first resolved ladder wins
-    //Only two-liberty groups with a solver-certified winning chase (attacker first).
-    //One-liberty hanging stones (an atari already on the board, e.g. after the defender
-    //tenuki'd to a ladder breaker) are deliberately NOT value-overridden: the shipped
-    //reference fork's design keeps the position value honest there ("never a flat
-    //position-level winrate change") and handles the situation on the policy side via
-    //the winning-ladder-capture boost instead. The defender's own extension lands on
-    //the two-liberty path covered here.
     if(libs != 2 || !captured)
       return;
     Color stone = board.colors[loc];
