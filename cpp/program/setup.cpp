@@ -46,6 +46,7 @@ static void loadLzLadderParams(ConfigParser& cfg) {
   if(cfg.contains("lzLadderEnabled")) p.enabled = cfg.getBool("lzLadderEnabled");
   if(cfg.contains("lzLadderMinStones")) p.minStones = cfg.getInt("lzLadderMinStones",1,361);
   if(cfg.contains("lzLadderValueBlend")) p.valueBlend = cfg.getDouble("lzLadderValueBlend",0.0,1.0);
+  if(cfg.contains("lzLadderDefenderBlend")) p.defenderBlend = cfg.getDouble("lzLadderDefenderBlend",0.0,1.0);
   if(cfg.contains("lzLadderMaxPlies")) p.maxPlies = cfg.getInt("lzLadderMaxPlies",2,400);
   if(cfg.contains("lzLadderCheckNodes")) p.checkNodes = cfg.getInt("lzLadderCheckNodes",1,362);
   if(cfg.contains("lzLadderMinPolicy")) p.minPolicy = cfg.getDouble("lzLadderMinPolicy",1e-9,1.0);
