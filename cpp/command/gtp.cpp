@@ -2161,7 +2161,7 @@ int MainCmds::gtp(const vector<string>& args) {
 
   const bool hasHumanModel = humanModelFile != "";
 
-  auto loadParams = [&hasHumanModel](ConfigParser& config, SearchParams& genmoveOut, SearchParams& analysisOut) {
+  auto loadParams = [&hasHumanModel,&nnModelFile](ConfigParser& config, SearchParams& genmoveOut, SearchParams& analysisOut) {
     SearchParams params = Setup::loadSingleParams(config,Setup::SETUP_FOR_GTP,hasHumanModel);
     //Set a default for conservativePass that differs from matches or selfplay
     if(!config.contains("conservativePass"))
@@ -2178,6 +2178,18 @@ int MainCmds::gtp(const vector<string>& args) {
 
     genmoveOut = params;
     analysisOut = params;
+
+    //LZ models: zero the genmove move-selection temperature (defaults 0.1, early 0.5).
+    //Analysis mode ignores these by design, so analysis-based strength testing does not
+    //see them; genmove play without this gets randomized away from the best move. cfg
+    //explicit values still win. nnRandomize is handled in Setup::initializeNNEvaluators.
+    if(!config.contains("nnRandomize")
+       && !config.contains("chosenMoveTemperature")
+       && !config.contains("chosenMoveTemperatureEarly")
+       && Setup::isLZWeightFile(nnModelFile)) {
+      genmoveOut.chosenMoveTemperature = 0.0;
+      genmoveOut.chosenMoveTemperatureEarly = 0.0;
+    }
 
     genmoveOut.antiMirror = genmoveAntiMirror;
     analysisOut.wideRootNoise = analysisWideRootNoise;

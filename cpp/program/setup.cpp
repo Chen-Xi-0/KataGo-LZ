@@ -12,13 +12,14 @@
 using namespace std;
 
 //Sniff whether the model file is a Leela Zero text weight file. Light-weight: reads and
-//(maybe) gunzips the file once, no model construction. Used to auto-disable nnRandomize
-//for LZ models - the LZ weights are not exactly equivariant under the 8 symmetries, so
+//(maybe) gunzips the file once, no model construction. Used to auto-configure LZ-friendly
+//search defaults: the LZ weights are not exactly equivariant under the 8 symmetries, so
 //per-node random symmetries add noise that the search amplifies into chaotic move
-//selection (see 05_验证输出/对弈全败根因_nnRandomize噪声_20261025.md).
-static bool isLZWeightFile(const string& fileName) {
-  string lower = Global::toLower(fileName);
-  if(Global::isSuffix(lower,".onnx") || Global::isSuffix(lower,".onnx.gz"))
+//selection (see 05_验证输出/对弈全败根因_nnRandomize噪声_20261025.md), and the
+//chosen-move temperature randomizes away the best move in genmove (analysis mode ignores
+//it, so analysis-based testing does not see it).
+bool Setup::isLZWeightFile(const string& fileName) {
+  string lower = Global::toLower(fileName);  if(Global::isSuffix(lower,".onnx") || Global::isSuffix(lower,".onnx.gz"))
     return false;
   try {
     string uncompressed;
@@ -246,6 +247,8 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
     //LZ models: default nnRandomize off (weights are not symmetry-equivariant; random
     //per-node symmetries poison the search). An explicit cfg value still wins, so users
     //can experiment, but an unset key now means off rather than on for LZ.
+    //The chosen-move temperature is handled in the GTP layer (gtp.cpp loadParams), where
+    //the genmove search params live - analysis mode ignores it by design.
     if(!cfg.contains("nnRandomize") && setupFor != SETUP_FOR_DISTRIBUTED && isLZWeightFile(nnModelFile)) {
       nnRandomize = false;
       logger.write("LZ weight file detected, nnRandomize disabled by default");
