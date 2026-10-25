@@ -22,6 +22,8 @@ static void loadLzLadderParams(ConfigParser& cfg) {
   if(cfg.contains("lzLadderPolicyFactor")) p.policyFactor = cfg.getDouble("lzLadderPolicyFactor",1e-6,1.0);
   if(cfg.contains("lzLadderPenaltyBase")) p.penaltyRank = cfg.getInt("lzLadderPenaltyBase",0,361);
   if(cfg.contains("lzLadderChaseStones")) p.chaseStones = cfg.getInt("lzLadderChaseStones",1,361);
+  if(cfg.contains("lzLadderBoostPolicy")) p.boostPolicy = cfg.getDouble("lzLadderBoostPolicy",0.0,100.0);
+  if(cfg.contains("lzLadderBoostWinrate")) p.boostWinrate = cfg.getDouble("lzLadderBoostWinrate",0.0,10.0);
 }
 
 void Setup::initializeSession(ConfigParser& cfg) {
