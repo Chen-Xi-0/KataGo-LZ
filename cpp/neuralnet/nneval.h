@@ -67,8 +67,8 @@ struct NNResultBuf {
 };
 
 //Parameters of the v5 LZ ladder correction (solver verdict + forced-line expansion +
-//same-net end-position evaluation), plus the shipped-fork winning-ladder-capture boost.
-//Loaded from cfg in setup.cpp; only takes effect for LZ models (isLZModelFlag).
+//same-net end-position evaluation). Loaded from cfg in setup.cpp; only takes effect for
+//LZ models (isLZModelFlag).
 namespace LzLadder {
   struct Params {
     bool enabled;        //lzLadderEnabled: master switch
@@ -80,8 +80,6 @@ namespace LzLadder {
     double policyFactor; //lzLadderPolicyFactor: demote-to factor below the penaltyRank move
     int penaltyRank;     //lzLadderPenaltyBase: rank index the demoted move drops below
     int chaseStones;     //lzLadderChaseStones: min opponent-group size for chase demotion
-    double boostPolicy;  //lzLadderBoostPolicy: winning-atari promoted to topPrior * this
-    double boostWinrate; //lzLadderBoostWinrate: mover winrate += wr*boostedPrior * this
 
     Params();
   };
