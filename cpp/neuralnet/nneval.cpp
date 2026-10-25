@@ -1957,7 +1957,17 @@ void NNEvaluator::evaluateWithLzLadder(
     }
     if(endWhiteWin >= 0.0f)
       return; //first resolved ladder wins
-    if(libs != 2 || !captured)
+    //Two-liberty groups: only when the solver certifies the chase wins (attacker first).
+    //One-liberty groups - an atari already hanging on the board, e.g. after the defender
+    //tenuki'd to a ladder breaker: the attacker can capture on demand whenever it is the
+    //attacker's turn, so no solver verdict is needed; the expander's first move resolves
+    //it on the board (self-verifying). The defender-to-move case needs no override: its
+    //extension lands on the two-liberty path above.
+    if(libs == 2) {
+      if(!captured)
+        return;
+    }
+    else if(libs != 1)
       return;
     Color stone = board.colors[loc];
     if(stone == C_EMPTY || stone == nextPlayer)
