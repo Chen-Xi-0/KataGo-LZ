@@ -1128,7 +1128,7 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
 namespace LzLadder {
   Params params;
   Params::Params()
-    : enabled(true), minStones(3), valueBlend(0.8), maxPlies(40),
+    : enabled(true), minStones(1), valueBlend(0.8), maxPlies(40),
       checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4) {}
 }
 
