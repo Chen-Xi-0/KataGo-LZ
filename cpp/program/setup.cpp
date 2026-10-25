@@ -6,9 +6,38 @@
 #include "../core/fileutils.h"
 #include "../neuralnet/nninterface.h"
 #include "../neuralnet/nneval.h"
+#include "../neuralnet/lzconverter.h"
 #include "../search/patternbonustable.h"
 
 using namespace std;
+
+//Sniff whether the model file is a Leela Zero text weight file. Light-weight: reads and
+//(maybe) gunzips the file once, no model construction. Used to auto-disable nnRandomize
+//for LZ models - the LZ weights are not exactly equivariant under the 8 symmetries, so
+//per-node random symmetries add noise that the search amplifies into chaotic move
+//selection (see 05_验证输出/对弈全败根因_nnRandomize噪声_20261025.md).
+static bool isLZWeightFile(const string& fileName) {
+  string lower = Global::toLower(fileName);
+  if(Global::isSuffix(lower,".onnx") || Global::isSuffix(lower,".onnx.gz"))
+    return false;
+  try {
+    string uncompressed;
+    string sha256Buf;
+    if(Global::isSuffix(lower,".txt") || Global::isSuffix(lower,".bin"))
+      FileUtils::loadFileIntoString(fileName,"",uncompressed,&sha256Buf);
+    else if(Global::isSuffix(lower,".gz"))
+      FileUtils::uncompressAndLoadFileIntoString(fileName,"",uncompressed,&sha256Buf);
+    else
+      return false;
+    //Only plain text candidates are LZ (.bin/.bin.gz are binary KataGo floats).
+    if(Global::isSuffix(lower,".bin") || Global::isSuffix(lower,".bin.gz"))
+      return false;
+    return LZConverter::looksLikeLZ(uncompressed);
+  }
+  catch(const std::exception&) {
+    return false;
+  }
+}
 
 //LZ ladder correction v5 parameters (see nneval.h). Only effective for LZ models.
 static void loadLzLadderParams(ConfigParser& cfg) {
@@ -214,6 +243,13 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
       setupFor == SETUP_FOR_DISTRIBUTED ? true :
       cfg.contains("nnRandomize") ? cfg.getBool("nnRandomize") :
       true;
+    //LZ models: default nnRandomize off (weights are not symmetry-equivariant; random
+    //per-node symmetries poison the search). An explicit cfg value still wins, so users
+    //can experiment, but an unset key now means off rather than on for LZ.
+    if(!cfg.contains("nnRandomize") && setupFor != SETUP_FOR_DISTRIBUTED && isLZWeightFile(nnModelFile)) {
+      nnRandomize = false;
+      logger.write("LZ weight file detected, nnRandomize disabled by default");
+    }
 
     string nnRandSeed;
     if(setupFor == SETUP_FOR_DISTRIBUTED)
