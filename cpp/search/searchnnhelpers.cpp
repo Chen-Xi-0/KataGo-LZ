@@ -33,7 +33,7 @@ void Search::computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwner
     nnInputParams.maxHistory = 0;
   nnInputParams.useDynamicKomi = searchParams.useDynamicKomi || dynamicKomiSet;
   nnInputParams.dynamicKomi = currentDynamicKomi;
-  nnEvaluator->evaluate(
+  nnEvaluator->evaluateWithLzLadder(
     board, hist, pla, &searchParams.humanSLProfile,
     nnInputParams,
     nnResultBuf, skipCache, includeOwnerMap
@@ -294,7 +294,7 @@ bool Search::initNodeNNOutput(
     }
   }
   else {
-    nnEvaluator->evaluate(
+    nnEvaluator->evaluateWithLzLadder(
       thread.board, thread.history, thread.pla, &searchParams.humanSLProfile,
       nnInputParams,
       thread.nnResultBuf, skipCache, includeOwnerMap

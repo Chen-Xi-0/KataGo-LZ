@@ -66,6 +66,26 @@ struct NNResultBuf {
   NNResultBuf& operator=(const NNResultBuf& other) = delete;
 };
 
+//Parameters of the v5 LZ ladder correction (solver verdict + forced-line expansion +
+//same-net end-position evaluation). Loaded from cfg in setup.cpp; only takes effect for
+//LZ models (isLZModelFlag).
+namespace LzLadder {
+  struct Params {
+    bool enabled;        //lzLadderEnabled: master switch
+    int minStones;       //lzLadderMinStones: minimum chased-group size for the value override
+    double valueBlend;   //lzLadderValueBlend: 0..1 blend of the end-position winrate
+    int maxPlies;        //lzLadderMaxPlies: cap of the expanded ladder line
+    int checkNodes;      //lzLadderCheckNodes: policy candidates checked for demotion
+    double minPolicy;    //lzLadderMinPolicy: candidate policy floor (probability space)
+    double policyFactor; //lzLadderPolicyFactor: demote-to factor below the penaltyRank move
+    int penaltyRank;     //lzLadderPenaltyBase: rank index the demoted move drops below
+    int chaseStones;     //lzLadderChaseStones: min opponent-group size for chase demotion
+
+    Params();
+  };
+  extern Params params;
+}
+
 // Result of NNEvaluator::benchmarkPureForward
 struct NNEvalBenchmarkResult {
   int batchSize;
@@ -194,6 +214,20 @@ class NNEvaluator {
     bool includeOwnerMap
   );
   void evaluate(
+    const Board& board,
+    const BoardHistory& history,
+    Player nextPlayer,
+    const SGFMetadata* sgfMeta,
+    const MiscNNInputParams& nnInputParams,
+    NNResultBuf& buf,
+    bool skipCache,
+    bool includeOwnerMap
+  );
+  //v5 LZ ladder wrapper around evaluate(): afterwards, if a solver-proven capturable big
+  //ladder exists, resolve it on the board, evaluate the captured position with the same net
+  //(a clean sequential call) and blend that winrate in. No-op for native KataGo nets and
+  //when lzLadderEnabled is false. Search threads should use this instead of evaluate().
+  void evaluateWithLzLadder(
     const Board& board,
     const BoardHistory& history,
     Player nextPlayer,
