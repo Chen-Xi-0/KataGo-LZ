@@ -1128,7 +1128,7 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
 namespace LzLadder {
   Params params;
   Params::Params()
-    : enabled(true), minStones(1), valueBlend(0.8), defenderBlend(0.0), maxPlies(40),
+    : enabled(true), minStones(1), valueBlend(0.8), maxPlies(40),
       checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
       boostFactor(1.5) {}
 }
@@ -1147,8 +1147,7 @@ namespace LzLadder {
 //only the precise end board may differ from the defender's best counter-play.
 static bool expandLadderLine(
   const Board& startBoard, const BoardHistory& startHist, Player attacker, Loc groupLoc,
-  int maxPlies, Board& endBoard, BoardHistory& endHist,
-  bool defenderFirst = false
+  int maxPlies, Board& endBoard, BoardHistory& endHist
 ) {
   const Player defender = getOpp(attacker);
   vector<Loc> buf;
@@ -1164,55 +1163,6 @@ static bool expandLadderLine(
       std::fprintf(stderr, "[LADT] %s %s %s\n", role, pla == P_BLACK ? "B" : "W",
         Global::strprintf("%c%d", "ABCDEFGHJKLMNOPQRST"[Location::getX(m,b.x_size)], b.y_size - Location::getY(m,b.x_size)).c_str());
   };
-
-  if(defenderFirst) {
-    if(endBoard.getNumLiberties(groupLoc) != 1)
-      return false;
-    Loc lib = Board::NULL_LOC;
-    {
-      const int xSize = endBoard.x_size;
-      Loc head = endBoard.chain_head[groupLoc];
-      for(int y = 0; y < endBoard.y_size && lib == Board::NULL_LOC; y++) {
-        for(int x = 0; x < xSize; x++) {
-          if(endBoard.chain_head[Location::getLoc(x,y,xSize)] != head)
-            continue;
-          for(int d = 0; d<4; d++) {
-            int nx = x + (d==0?1:d==1?-1:0);
-            int ny = y + (d==2?1:d==3?-1:0);
-            if(nx < 0 || nx >= xSize || ny < 0 || ny >= endBoard.y_size)
-              continue;
-            Loc nb = Location::getLoc(nx,ny,xSize);
-            if(endBoard.colors[nb] == C_EMPTY) { lib = nb; break; }
-          }
-          if(lib != Board::NULL_LOC) break;
-        }
-      }
-    }
-    if(lib == Board::NULL_LOC)
-      return false;
-    Board trial(endBoard);
-    BoardHistory trialHist(endHist);
-    if(!trialHist.makeBoardMoveTolerant(trial, lib, defender))
-      return false;
-    traceMove("DEF-EXT", defender, lib, trial);
-    const int extLibs = trial.getNumLiberties(lib);
-    if(extLibs >= 3) {
-      endBoard = trial; endHist = trialHist;
-      if(trace) std::fprintf(stderr, "[LADT] END escaped-3libs\n");
-      return true;
-    }
-    endBoard = trial; endHist = trialHist;
-    groupLoc = lib;
-    //The extension stayed in the chase. If the solver says the attacker cannot run
-    //the chase down from here, THE ESCAPE SUCCEEDED - the current board IS the line's
-    //end position (that static board is exactly what a weak net can still judge).
-    //Only when the chase is still winnable do we fall through to play it out.
-    vector<Loc> buf2; vector<Loc> wm2;
-    if(!endBoard.searchIsLadderCapturedAttackerFirst2Libs(groupLoc, buf2, wm2)) {
-      if(trace) std::fprintf(stderr, "[LADT] END escaped-solver\n");
-      return true;
-    }
-  }
 
   for(int plies = 0; plies < maxPlies; plies++) {
     const int curLibs = endBoard.getNumLiberties(groupLoc);
@@ -2048,43 +1998,6 @@ void NNEvaluator::evaluateWithLzLadder(
     Color stone = board.colors[loc];
     if(stone == C_EMPTY)
       return;
-
-    //v6 defender escape line: our own group is 1-liberty (capturable whenever the
-    //attacker moves) and it is our turn. Expand "extend at the liberty": if the escape
-    //succeeds (3+ libs outright, or the solver cannot run the chase down), the current
-    //board IS the end position - a static board the weak net can still judge, so a
-    //tenuki branch that left this threat hanging exposes its real cost. If the chase
-    //still wins, the line plays out to the capture instead.
-    if(stone == nextPlayer) {
-      //Reference-fork parity: the policy surgery above already demotes/moves like this one
-      //(defenseFail / chaseFail). The value override is an extra network evaluation per node,
-      //so it only runs when explicitly enabled; with defenderBlend==0 (default) it costs nothing.
-      if((float)P.defenderBlend <= 0.0f)
-        return;
-      if(libs != 1 || board.getChainSize(loc) < P.minStones)
-        return;
-      Board endBoard;
-      BoardHistory endHist(history);
-      if(!expandLadderLine(board, history, getOpp(nextPlayer), loc, P.maxPlies, endBoard, endHist, true))
-        return;
-      MiscNNInputParams endParams = nnInputParams;
-      endParams.symmetry = 0;
-      NNResultBuf endBuf;
-      try {
-        evaluate(endBoard, endHist, endHist.presumedNextMovePla, sgfMeta, endParams, endBuf, false, false);
-        float dEnd = endBuf.result->whiteWinProb;
-        float dBlend = (float)P.defenderBlend;
-        float dBlended = (1.0f - dBlend) * buf.result->whiteWinProb + dBlend * dEnd;
-        if(getenv("LZ_LADDER_DEBUG") != NULL)
-          std::fprintf(stderr, "[LADD] defender-line raw=%.4f end=%.4f -> %.4f\n",
-            buf.result->whiteWinProb, dEnd, dBlended);
-        buf.result->whiteWinProb = dBlended;
-        buf.result->whiteLossProb = 1.0f - dBlended - buf.result->whiteNoResultProb;
-      }
-      catch(const std::exception&) {
-      }
-      return;
-    }
 
     //Reference-fork parity: the value override only speaks about solver-certified captures of
     //two-liberty groups (the defender has already run and the chase still wins). One-liberty

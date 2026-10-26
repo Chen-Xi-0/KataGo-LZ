@@ -74,7 +74,6 @@ namespace LzLadder {
     bool enabled;        //lzLadderEnabled: master switch
     int minStones;       //lzLadderMinStones: minimum chased-group size for the value override
     double valueBlend;   //lzLadderValueBlend: 0..1 blend of the end-position winrate
-    double defenderBlend;//lzLadderDefenderBlend: blend for defender-escape-line end values
     int maxPlies;        //lzLadderMaxPlies: cap of the expanded ladder line
     int checkNodes;      //lzLadderCheckNodes: policy candidates checked for demotion
     double minPolicy;    //lzLadderMinPolicy: candidate policy floor (probability space)
