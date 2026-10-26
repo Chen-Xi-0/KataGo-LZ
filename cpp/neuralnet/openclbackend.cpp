@@ -1,4 +1,4 @@
-﻿﻿#ifdef USE_OPENCL_BACKEND
+﻿#ifdef USE_OPENCL_BACKEND
 
 #include "../neuralnet/nninterface.h"
 #include "../neuralnet/openclincludes.h"

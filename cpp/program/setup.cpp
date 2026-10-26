@@ -53,6 +53,7 @@ static void loadLzLadderParams(ConfigParser& cfg) {
   if(cfg.contains("lzLadderPolicyFactor")) p.policyFactor = cfg.getDouble("lzLadderPolicyFactor",1e-6,1.0);
   if(cfg.contains("lzLadderPenaltyBase")) p.penaltyRank = cfg.getInt("lzLadderPenaltyBase",0,361);
   if(cfg.contains("lzLadderChaseStones")) p.chaseStones = cfg.getInt("lzLadderChaseStones",1,361);
+  if(cfg.contains("lzLadderBoostFactor")) p.boostFactor = cfg.getDouble("lzLadderBoostFactor",1.0,100.0);
 }
 
 void Setup::initializeSession(ConfigParser& cfg) {
