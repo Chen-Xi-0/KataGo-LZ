@@ -4159,10 +4159,10 @@ struct PolicyHead {
     gpoolToPassMul2(cudaHandles,&desc->gpoolToPassMul2,false)
   {
     if(hasFullPolicyMul) {
-      //pFullMul consumes the flattened spatial p1Activation output in position-major,
-      //channel-minor order, which only the NHWC activation layout provides.
-      if(!useNHWC)
-        throw StringError("CUDA/ROCm backend: LZ-style full policy matmul requires NHWC activation layout");
+      //pFullMul consumes the flattened spatial p1Activation output. desc's weights are laid out for
+      //position-major channel-minor order (pos*p1Channels+c, what NHWC buffers give), so under the
+      //NCHW layout (channel-major, c*numSpatial+pos) the weights are permuted below instead of
+      //forcing NHWC - on pre-Volta GPUs FP32+NCHW is the fast cudnn path.
       const int numSpatial = nnX * nnY;
       const int poc = p2Channels;
       const int fullOut = desc->pFullMul.outChannels;
@@ -4172,14 +4172,23 @@ struct PolicyHead {
       testAssert((int)desc->pFullMul.weights.size() == (size_t)inC * fullOut);
       testAssert(desc->pFullMulBias.numChannels == fullOut);
 
+      //Index into desc->pFullMul.weights' input dimension for the given engine input index.
+      const auto descInputIdx = [&](int ic) {
+        if(useNHWC)
+          return ic;
+        return (ic % numSpatial) * p1Channels + (ic / numSpatial);
+      };
+
       MatMulLayerDesc mainDesc;
       mainDesc.name = desc->pFullMul.name + ".main";
       mainDesc.inChannels = inC;
       mainDesc.outChannels = numSpatial * poc;
       mainDesc.weights.resize((size_t)inC * mainDesc.outChannels);
-      for(int ic = 0; ic < inC; ic++)
+      for(int ic = 0; ic < inC; ic++) {
+        const size_t srcRow = (size_t)descInputIdx(ic) * fullOut;
         for(int oc = 0; oc < mainDesc.outChannels; oc++)
-          mainDesc.weights[(size_t)ic * mainDesc.outChannels + oc] = desc->pFullMul.weights[(size_t)ic * fullOut + oc];
+          mainDesc.weights[(size_t)ic * mainDesc.outChannels + oc] = desc->pFullMul.weights[srcRow + oc];
+      }
       MatBiasLayerDesc mainBiasDesc;
       mainBiasDesc.name = desc->pFullMulBias.name + ".main";
       mainBiasDesc.numChannels = mainDesc.outChannels;
@@ -4193,9 +4202,11 @@ struct PolicyHead {
       passDesc.inChannels = inC;
       passDesc.outChannels = poc;
       passDesc.weights.resize((size_t)inC * poc);
-      for(int ic = 0; ic < inC; ic++)
+      for(int ic = 0; ic < inC; ic++) {
+        const size_t srcRow = (size_t)descInputIdx(ic) * fullOut + mainDesc.outChannels;
         for(int c = 0; c < poc; c++)
-          passDesc.weights[(size_t)ic * poc + c] = desc->pFullMul.weights[(size_t)ic * fullOut + mainDesc.outChannels + c];
+          passDesc.weights[(size_t)ic * poc + c] = desc->pFullMul.weights[srcRow + c];
+      }
       MatBiasLayerDesc passBiasDesc;
       passBiasDesc.name = desc->pFullMulBias.name + ".pass";
       passBiasDesc.numChannels = poc;
@@ -4266,8 +4277,8 @@ struct PolicyHead {
 
     if(hasFullPolicyMul) {
       //Leela-Zero-style policy head: p1Conv -> p1BN(+ReLU) -> flatten -> pFullMul -> bias.
-      //The internals run NHWC (enforced for LZ models in createComputeHandle), so p1BN's output
-      //is position-major channel-minor per batch, exactly the flattened vector pFullMul expects.
+      //pFullMul's weights were built for whichever layout is in use (see the constructor), so the
+      //p1BN output can be fed straight in as the flattened vector under NHWC or NCHW.
       float* p1BnIn;
       float* p1BnOut;
       if(!usingFP16) {
@@ -4855,7 +4866,9 @@ struct Buffers {
       inputMetaBuf = NULL;
     }
 
-    if(m.modelVersion >= 17)
+    if(m.policyHead->hasFullPolicyMul)
+      testAssert(m.policyHead->p2Channels == 1);
+    else if(m.modelVersion >= 17)
       testAssert(m.policyHead->p2Channels == 2 || m.policyHead->p2Channels == 4);
     else if(m.modelVersion >= 16)
       testAssert(m.policyHead->p2Channels == 4);
@@ -5266,14 +5279,11 @@ ComputeHandle* NeuralNet::createComputeHandle(
     useNHWC = true;
   }
 
-  //LZ-style models (LZConverter) use full spatial matmuls for the policy and value heads, which
-  //consume the activation in position-major channel-minor order. Only NHWC internals provide that
-  //order for p1Conv's multi-channel output, so force NHWC like transformer models do.
-  if(!useNHWC && loadedModel->modelDesc.isLZModel) {
-    if(context->useNHWCMode == enabled_t::False)
-      throw StringError("CUDA backend: LZ models require NHWC, but cudaUseNHWC=false was set");
-    useNHWC = true;
-  }
+  //LZ-style models (LZConverter) use full spatial matmuls for the policy and value heads. Those
+  //are handled under either layout: the policy head permutes pFullMul's input dimension when NCHW
+  //(see PolicyHead), and the value head's v1Conv has a single output channel so both flattenings
+  //coincide. So unlike transformer models, LZ models do NOT need NHWC forced here - keeping NCHW
+  //lets pre-Volta GPUs use the FP32 NCHW cudnn path, which is much faster than FP32 NHWC there.
 
   if(logger != NULL) {
     logger->write(
