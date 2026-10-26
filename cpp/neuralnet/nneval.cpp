@@ -1122,14 +1122,15 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
 //    征子修正v3_对齐参考实现设计_20261025.md, v5 section);
 //  - policy surgery keeps the reference fork's mild semantics: demote moves that leave a
 //    solver-dead group (just below the 3rd-ranked move, probability factor 0.9) and zero
-//    futile chases of solver-alive groups. No boost.
+//    futile chases of solver-alive groups, and a boost for escapes the solver proves alive.
 //Only used for LZ models; native KataGo nets are unaffected.
 
 namespace LzLadder {
   Params params;
   Params::Params()
-    : enabled(true), minStones(1), valueBlend(0.8), defenderBlend(1.0), maxPlies(40),
-      checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4) {}
+    : enabled(true), minStones(1), valueBlend(0.8), defenderBlend(0.0), maxPlies(40),
+      checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
+      boostFactor(1.5) {}
 }
 
 //The value override lives one level up (evaluateWithLzLadder): calling evaluate() from inside
@@ -1392,9 +1393,12 @@ static void applyLZLadderCorrectionV5(
   static const int NDY[4] = {0,0,1,-1};
   vector<Loc> buf;
 
-  //Policy surgery on the top candidates: mild rank demotion for moves that leave a
-  //solver-dead own group, zeroing for futile chases of solver-alive groups. No boost - the
-  //reference fork (leela-zero-ladder) has none, and the value override carries the magnitude.
+  //Policy surgery on the top candidates, mirroring the reference fork's LadderDetection:
+  //mild rank demotion for moves that leave a solver-dead own group, zeroing for futile chases
+  //of solver-alive groups. The reference implementation also BOOSTS escapes that work and
+  //scales its winrate change by the move's own prior (LK/lzl-src/src/LadderDetection.cpp);
+  //neither is ported here yet, so the magnitude still comes from the value override in
+  //evaluateWithLzLadder. Do not describe this as "same as the reference" until those land.
   vector<pair<float,int>> candidates;
   candidates.reserve(policySize);
   for(int pos = 0; pos<policySize; pos++) {
@@ -1457,6 +1461,7 @@ static void applyLZLadderCorrectionV5(
 
     bool defenseFail = false;
     bool chaseFail = false;
+    bool defenseOk = false;
 
     Loc checkedHeads[4];
     int numChecked = 0;
@@ -1490,6 +1495,8 @@ static void applyLZLadderCorrectionV5(
           vector<Loc> wm;
           if(copy.searchIsLadderCapturedAttackerFirst2Libs(nb,buf,wm))
             defenseFail = true;
+          else
+            defenseOk = true;
         }
       }
       else {
@@ -1506,6 +1513,14 @@ static void applyLZLadderCorrectionV5(
       policy[pos] = demoteLogit;
     else if(chaseFail)
       policy[pos] = -1e30f;
+    else if(defenseOk && (float)P.boostFactor > 1.0f) {
+      //Reference fork's boost: a move that leaves our own two-liberty group ALIVE (the solver
+      //says the opponent cannot run the chase down) is the escape that actually works, so lift
+      //it above the current top candidate instead of only penalising failed ones.
+      const float boostLogit = maxLogit + std::log((float)P.boostFactor);
+      if(boostLogit > policy[pos])
+        policy[pos] = boostLogit;
+    }
   }
 }
 
@@ -2041,6 +2056,11 @@ void NNEvaluator::evaluateWithLzLadder(
     //tenuki branch that left this threat hanging exposes its real cost. If the chase
     //still wins, the line plays out to the capture instead.
     if(stone == nextPlayer) {
+      //Reference-fork parity: the policy surgery above already demotes/moves like this one
+      //(defenseFail / chaseFail). The value override is an extra network evaluation per node,
+      //so it only runs when explicitly enabled; with defenderBlend==0 (default) it costs nothing.
+      if((float)P.defenderBlend <= 0.0f)
+        return;
       if(libs != 1 || board.getChainSize(loc) < P.minStones)
         return;
       Board endBoard;
@@ -2066,6 +2086,14 @@ void NNEvaluator::evaluateWithLzLadder(
       return;
     }
 
+    //Reference-fork parity: the value override only speaks about solver-certified captures of
+    //two-liberty groups (the defender has already run and the chase still wins). One-liberty
+    //groups - which may well be laddered single stones - are handled by the policy surgery
+    //above; overriding their VALUE used to force the node onto "what the board looks like after
+    //we fill that liberty", which let an unrelated throw-in hijack the node (first resolved
+    //group wins) and starved the real ladder group elsewhere on the board.
+    if(libs != 2 || !captured)
+      return;
     if(board.getChainSize(loc) < P.minStones)
       return;
     Board endBoard;

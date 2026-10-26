@@ -81,6 +81,7 @@ namespace LzLadder {
     double policyFactor; //lzLadderPolicyFactor: demote-to factor below the penaltyRank move
     int penaltyRank;     //lzLadderPenaltyBase: rank index the demoted move drops below
     int chaseStones;     //lzLadderChaseStones: min opponent-group size for chase demotion
+    double boostFactor;  //lzLadderBoostFactor: >1 lifts a proven-alive escape above the top
 
     Params();
   };
