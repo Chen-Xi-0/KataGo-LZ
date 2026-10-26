@@ -40,6 +40,9 @@ namespace Tests {
   void runSgfTests();
   void runSgfFileTests();
 
+  //command/writetrainingdata.cpp
+  void runTrainingDataResultTests();
+
   //testnninputs.cpp
   void runNNInputsV3V4Tests();
   void runExcludeTerritoryAtariNNInputsTests();

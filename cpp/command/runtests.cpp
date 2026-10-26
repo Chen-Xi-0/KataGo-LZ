@@ -52,6 +52,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runBoardStressTest();
 
   Tests::runSgfTests();
+  Tests::runTrainingDataResultTests();
   Tests::runBasicSymmetryTests();
   Tests::runBoardSymmetryTests();
   Tests::runSymmetryDifferenceTests();

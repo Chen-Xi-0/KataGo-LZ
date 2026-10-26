@@ -13,12 +13,21 @@
 #include "../program/play.h"
 #include "../command/commandline.h"
 #include "../core/test.h"
+#include "../tests/tests.h"
 #include "../main.h"
 
 #include <chrono>
 #include <csignal>
 
 using namespace std;
+
+// Called after normalizing the result; other result forms have their own handling.
+static bool parseSgfResultWithoutScore(const string& s, Player& winner) {
+  if(s != "b+" && s != "w+")
+    return false;
+  winner = s == "b+" ? P_BLACK : P_WHITE;
+  return true;
+}
 
 static ValueTargets makeForcedWinnerValueTarget(Player winner) {
   ValueTargets targets;
@@ -39,6 +48,37 @@ static ValueTargets makeForcedWinnerValueTarget(Player winner) {
   targets.hasLead = false;
   targets.lead = 0.0f;
   return targets;
+}
+
+void Tests::runTrainingDataResultTests() {
+  cout << "Running training data result tests" << endl;
+  struct TestCase {
+    const char* result;
+    Player winner;
+  };
+  const TestCase cases[] = {
+    {"B+",P_BLACK}, {"W+",P_WHITE}, {"b+",P_BLACK}, {"w+",P_WHITE},
+    {" B+ ",P_BLACK}, {" w+ ",P_WHITE}
+  };
+  for(const TestCase& testCase: cases) {
+    std::unique_ptr<Sgf> sgf = Sgf::parse(string("(;GM[1]FF[4]SZ[9]RE[") + testCase.result + "])");
+    string result = Global::trim(Global::toLower(sgf->getRootPropertyWithDefault("RE", "")));
+    Player winner = C_EMPTY;
+    testAssert(parseSgfResultWithoutScore(result,winner));
+    testAssert(winner == testCase.winner);
+    ValueTargets targets = makeForcedWinnerValueTarget(winner);
+    // Training values are stored from White's perspective before per-row conversion.
+    testAssert(targets.win == (testCase.winner == P_WHITE ? 1.0f : 0.0f));
+    testAssert(targets.loss == (testCase.winner == P_BLACK ? 1.0f : 0.0f));
+    testAssert(targets.noResult == 0.0f);
+    testAssert(targets.score == (testCase.winner == P_WHITE ? 0.5f : -0.5f));
+    testAssert(!targets.hasLead);
+  }
+  for(const char* result: {"", "?", "draw", "b+r", "w+t", "w+3.5"}) {
+    Player winner = C_EMPTY;
+    testAssert(!parseSgfResultWithoutScore(result,winner));
+    testAssert(winner == C_EMPTY);
+  }
 }
 
 static void getNNEval(
@@ -1575,15 +1615,9 @@ int MainCmds::writetrainingdata(const vector<string>& args) {
           return;
         }
       }
-      else if(s == "b+") {
+      else if(parseSgfResultWithoutScore(s,sgfGameWinner)) {
         sgfGameEnded = true;
         sgfGameEndedButRecordIncomplete = true;
-        sgfGameWinner = P_BLACK;
-      }
-      else if(s == "w+") {
-        sgfGameEnded = true;
-        sgfGameEndedButRecordIncomplete = true;
-        sgfGameWinner = P_BLACK;
       }
       else {
         logger.write("Game ended with unknown result " + fileName + " result " + sgfResult);
