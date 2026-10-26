@@ -258,6 +258,11 @@ struct ModelParser {
     auto& network = model->network;
     auto modelDesc = &model->rawModel->modelDesc;
 
+    if(modelDesc->isLZModel)
+      throw StringError(
+        "TensorRT backend: LZ-style models (converted Leela Zero weights) are only supported by the "
+        "ONNX path. Remove trtDisableOnnx (or set it to false).");
+
     if(modelDesc->numInputMetaChannels > 0) {
       tuneDesc = Global::strprintf(
         R"|("salt"(%d)"modelwithmeta"(%d,%d,%d,%d,%d,%d,%d))|",

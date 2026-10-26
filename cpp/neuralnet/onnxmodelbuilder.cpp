@@ -364,6 +364,24 @@ struct Builder {
     return addNode("Add", {input, bName}, uniq(desc.name), desc.name);
   }
 
+  // MatMul on a flattened 2D [N,inC] tensor. MatMulLayerDesc.weights is [inC,outC] (file order),
+  // exactly ONNX MatMul's [inC,outC]. Used by the LZ-style full policy/value heads, whose FC layers
+  // consume a whole flattened board rather than per-position channels.
+  string buildFlattenedMatMul(const string& input, const MatMulLayerDesc& desc) {
+    int inC = desc.inChannels, outC = desc.outChannels;
+    testAssert((int)desc.weights.size() == inC * outC);
+    string wName = addInitializer(desc.name + ".Wflat", {inC, outC}, desc.weights.data(), desc.weights.size());
+    return addNode("MatMul", {input, wName}, uniq(desc.name + "/flat"), desc.name + "/flat");
+  }
+
+  // Per-channel bias on a flattened 2D [N,C] tensor (broadcast over [1,C]).
+  string buildMatBiasFlat(const string& input, const MatBiasLayerDesc& desc) {
+    int C = desc.numChannels;
+    testAssert((int)desc.weights.size() == C);
+    string bName = addInitializer(desc.name + ".bflat", {1, C}, desc.weights.data(), C);
+    return addNode("Add", {input, bName}, uniq(desc.name + "/flatbias"), desc.name + "/flatbias");
+  }
+
   // BatchNorm as per-channel affine: out = input * mergedScale + mergedBias, broadcast over the
   // channel dim. NCHW broadcasts over [1,C,1,1]; NHWC ([N,H,W,C]) over [1,1,1,C].
   string buildBatchNorm(const string& input, const BatchNormLayerDesc& desc, bool useNHWC) {
@@ -508,7 +526,16 @@ struct Builder {
     x = buildActivation(x, rb.midActivation);
     x = applyMaskLayout(x, "InputMask", rb.name + "/mid", useNHWC);
     x = buildConv(x, rb.finalConv, useNHWC);
-    return elementwise("Add", input, x, rb.name);
+    string out = elementwise("Add", input, x, rb.name);
+    if(rb.hasPostNorm) {
+      //LZ-style postnorm block: the accumulated trunk flow is normalized and activated after the
+      //residual add, before the next block. Mask then ReLU is equivalent to ReLU then mask because
+      //the mask is 0/1 and ReLU(0) == 0.
+      out = buildBatchNorm(out, rb.postBN, useNHWC);
+      out = buildActivation(out, rb.postActivation);
+      out = applyMaskLayout(out, "InputMask", rb.name + "/post", useNHWC);
+    }
+    return out;
   }
 
   // Global pooling block. The pooling itself (cross-spatial reductions, concat, matmul-to-bias) is
@@ -959,7 +986,7 @@ struct Builder {
         cur = useNHWC ? buildTransformerFFNBlockNhwc(cur, ffn)
                       : buildTransformerFFNBlock(cur, ffn, "InputMask");
       }
-      else if(kind == ORDINARY_BLOCK_KIND) {
+      else if(kind == ORDINARY_BLOCK_KIND || kind == POSTNORM_BLOCK_KIND) {
         cur = buildResidualBlock(cur, *static_cast<const ResidualBlockDesc*>(bp), useNHWC);
       }
       else if(kind == GLOBAL_POOLING_BLOCK_KIND) {
@@ -1224,27 +1251,82 @@ Result build(
   {
     const PolicyHeadDesc& ph = desc.policyHead;
     string p1 = b.buildConv(trunkTip, ph.p1Conv, false);
-    string g1 = b.buildConv(trunkTip, ph.g1Conv, false);
-    g1 = b.buildBatchNorm(g1, ph.g1BN, false);
-    g1 = b.buildActivation(g1, ph.g1Activation);
-    g1 = b.applyMask(g1, "InputMask", ph.name + "/g1");
-    string gpool = b.applyGPool(g1, "InputMask", ph.name + "/g", false);
-    string gbias = b.buildMatMul(gpool, ph.gpoolToBiasMul);
-    string p1b = b.elementwise("Add", p1, gbias, ph.name + "/gpbias");
-    p1b = b.buildBatchNorm(p1b, ph.p1BN, false);
-    p1b = b.buildActivation(p1b, ph.p1Activation);
-    p1b = b.applyMask(p1b, "InputMask", ph.name + "/p1");
-    string p2 = b.buildConv(p1b, ph.p2Conv, false);
 
+    string p2;
     string pass;
-    if(desc.modelVersion >= 15) {
-      string pm = b.buildMatMul(gpool, ph.gpoolToPassMul);
-      pm = b.buildMatBias(pm, ph.gpoolToPassBias);
-      pm = b.buildActivation(pm, ph.passActivation);
-      pass = b.buildMatMul(pm, ph.gpoolToPassMul2);
+    if(ph.hasFullPolicyMul) {
+      //LZ-style policy head: p1Conv -> p1BN(+ReLU) -> flatten -> pFullMul -> bias, no global
+      //pooling. p1b is [N,p1C,H,W] NCHW; the LZ FC consumes a position-major, channel-minor
+      //(i.e. NHWC) flattening of the whole board.
+      string p1b = b.buildBatchNorm(p1, ph.p1BN, false);
+      p1b = b.buildActivation(p1b, ph.p1Activation);
+      p1b = b.applyMask(p1b, "InputMask", ph.name + "/p1");
+      string p1Nhwc = b.nchwToNhwc(p1b, ph.name + "/p1nhwc");
+      string p1Flat = b.reshape(p1Nhwc, {0, -1}, ph.name + "/p1flat");
+
+      //Split pFullMul into the spatial columns and the single pass column so each output can be
+      //reshaped into the 4D shapes the backend expects (mirrors the CUDA backend).
+      const int numSpatial = nnXLen * nnYLen;
+      const int poc = ph.policyOutChannels;
+      const int fullOut = ph.pFullMul.outChannels;
+      const int inC = ph.pFullMul.inChannels;
+      testAssert(fullOut == poc * (numSpatial + 1));
+      MatMulLayerDesc mainDesc;
+      mainDesc.name = ph.pFullMul.name + ".main";
+      mainDesc.inChannels = inC;
+      mainDesc.outChannels = numSpatial * poc;
+      mainDesc.weights.resize((size_t)inC * mainDesc.outChannels);
+      for(int ic = 0; ic < inC; ic++)
+        for(int oc = 0; oc < mainDesc.outChannels; oc++)
+          mainDesc.weights[(size_t)ic * mainDesc.outChannels + oc] = ph.pFullMul.weights[(size_t)ic * fullOut + oc];
+      MatBiasLayerDesc mainBiasDesc;
+      mainBiasDesc.name = ph.pFullMulBias.name + ".main";
+      mainBiasDesc.numChannels = mainDesc.outChannels;
+      mainBiasDesc.weights.assign(ph.pFullMulBias.weights.begin(), ph.pFullMulBias.weights.begin() + mainDesc.outChannels);
+
+      MatMulLayerDesc passDesc;
+      passDesc.name = ph.pFullMul.name + ".pass";
+      passDesc.inChannels = inC;
+      passDesc.outChannels = poc;
+      passDesc.weights.resize((size_t)inC * poc);
+      for(int ic = 0; ic < inC; ic++)
+        for(int c = 0; c < poc; c++)
+          passDesc.weights[(size_t)ic * poc + c] = ph.pFullMul.weights[(size_t)ic * fullOut + mainDesc.outChannels + c];
+      MatBiasLayerDesc passBiasDesc;
+      passBiasDesc.name = ph.pFullMulBias.name + ".pass";
+      passBiasDesc.numChannels = poc;
+      passBiasDesc.weights.assign(ph.pFullMulBias.weights.begin() + mainDesc.outChannels, ph.pFullMulBias.weights.end());
+
+      string mainOut = b.buildFlattenedMatMul(p1Flat, mainDesc);
+      mainOut = b.buildMatBiasFlat(mainOut, mainBiasDesc);
+      p2 = b.reshape(mainOut, {0, poc, nnYLen, nnXLen}, ph.name + "/p2out");
+
+      string passOut = b.buildFlattenedMatMul(p1Flat, passDesc);
+      passOut = b.buildMatBiasFlat(passOut, passBiasDesc);
+      pass = b.reshape(passOut, {0, poc, 1, 1}, ph.name + "/passout");
     }
     else {
-      pass = b.buildMatMul(gpool, ph.gpoolToPassMul);
+      string g1 = b.buildConv(trunkTip, ph.g1Conv, false);
+      g1 = b.buildBatchNorm(g1, ph.g1BN, false);
+      g1 = b.buildActivation(g1, ph.g1Activation);
+      g1 = b.applyMask(g1, "InputMask", ph.name + "/g1");
+      string gpool = b.applyGPool(g1, "InputMask", ph.name + "/g", false);
+      string gbias = b.buildMatMul(gpool, ph.gpoolToBiasMul);
+      string p1b = b.elementwise("Add", p1, gbias, ph.name + "/gpbias");
+      p1b = b.buildBatchNorm(p1b, ph.p1BN, false);
+      p1b = b.buildActivation(p1b, ph.p1Activation);
+      p1b = b.applyMask(p1b, "InputMask", ph.name + "/p1");
+      p2 = b.buildConv(p1b, ph.p2Conv, false);
+
+      if(desc.modelVersion >= 15) {
+        string pm = b.buildMatMul(gpool, ph.gpoolToPassMul);
+        pm = b.buildMatBias(pm, ph.gpoolToPassBias);
+        pm = b.buildActivation(pm, ph.passActivation);
+        pass = b.buildMatMul(pm, ph.gpoolToPassMul2);
+      }
+      else {
+        pass = b.buildMatMul(gpool, ph.gpoolToPassMul);
+      }
     }
 
     // Outputs
@@ -1276,14 +1358,39 @@ Result build(
     v1 = b.buildBatchNorm(v1, vh.v1BN, false);
     v1 = b.buildActivation(v1, vh.v1Activation);
     string v1Masked = b.applyMask(v1, "InputMask", vh.name + "/v1");
-    string gpool = b.applyGPool(v1Masked, "InputMask", vh.name + "/v", true);
-    string v2 = b.buildMatMul(gpool, vh.v2Mul);
-    v2 = b.buildMatBias(v2, vh.v2Bias);
+    string v2;
+    if(vh.hasFullValueMul) {
+      //LZ-style value head: flatten the single-channel spatial activation and feed it straight to
+      //v2Mul, skipping the three global pooling statistics. With C == 1 the NCHW flatten is
+      //already the position-major vector v2Mul expects.
+      string v1Flat = b.reshape(v1Masked, {0, -1}, vh.name + "/v1flat");
+      v2 = b.buildFlattenedMatMul(v1Flat, vh.v2Mul);
+      v2 = b.buildMatBiasFlat(v2, vh.v2Bias);
+    }
+    else {
+      string gpool = b.applyGPool(v1Masked, "InputMask", vh.name + "/v", true);
+      v2 = b.buildMatMul(gpool, vh.v2Mul);
+      v2 = b.buildMatBias(v2, vh.v2Bias);
+    }
     v2 = b.buildActivation(v2, vh.v2Activation);
-    string v3 = b.buildMatMul(v2, vh.v3Mul);
-    v3 = b.buildMatBias(v3, vh.v3Bias);
-    string sv3 = b.buildMatMul(v2, vh.sv3Mul);
-    sv3 = b.buildMatBias(sv3, vh.sv3Bias);
+
+    string v3;
+    string sv3;
+    if(vh.hasFullValueMul) {
+      //The 2D [N,C] results are reshaped back to [N,C,1,1] for the engine's output bindings.
+      v3 = b.buildFlattenedMatMul(v2, vh.v3Mul);
+      v3 = b.buildMatBiasFlat(v3, vh.v3Bias);
+      v3 = b.reshape(v3, {0, desc.numValueChannels, 1, 1}, vh.name + "/v3out");
+      sv3 = b.buildFlattenedMatMul(v2, vh.sv3Mul);
+      sv3 = b.buildMatBiasFlat(sv3, vh.sv3Bias);
+      sv3 = b.reshape(sv3, {0, desc.numScoreValueChannels, 1, 1}, vh.name + "/sv3out");
+    }
+    else {
+      v3 = b.buildMatMul(v2, vh.v3Mul);
+      v3 = b.buildMatBias(v3, vh.v3Bias);
+      sv3 = b.buildMatMul(v2, vh.sv3Mul);
+      sv3 = b.buildMatBias(sv3, vh.sv3Bias);
+    }
     string ownership = b.buildConv(v1Masked, vh.vOwnershipConv, false);
 
     auto markOutput = [&](const string& tensorName, const string& outName, int channels, bool spatial) {

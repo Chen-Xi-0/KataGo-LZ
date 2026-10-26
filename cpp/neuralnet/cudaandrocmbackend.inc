@@ -2101,6 +2101,9 @@ struct ResidualBlock {
   const string name;
   const NormActConv normActConv1;
   const NormActConv normActConv2;
+  //LZ-style postnorm block: BN+activation applied to the accumulated trunk flow after the
+  //residual add, before the next block. Null for ordinary blocks.
+  std::unique_ptr<BatchNormLayer> postBN;
 
   ResidualBlock() = delete;
   ResidualBlock(const ResidualBlock&) = delete;
@@ -2118,6 +2121,10 @@ struct ResidualBlock {
      normActConv1(cudaHandles,manager,&desc->preBN,&desc->preActivation,&desc->regularConv,nnX,nnY,useFP16,useNHWC),
      normActConv2(cudaHandles,manager,&desc->midBN,&desc->midActivation,&desc->finalConv,nnX,nnY,useFP16,useNHWC)
   {
+    if(desc->hasPostNorm)
+      postBN = std::make_unique<BatchNormLayer>(
+        cudaHandles,&desc->postBN,&desc->postActivation,nnX,nnY,useFP16,useNHWC
+      );
   }
 
   ~ResidualBlock()
@@ -2150,6 +2157,8 @@ struct ResidualBlock {
     SizedBuf<void*> midScratch(scratch->allocator, scratch->getBufSizeXY(normActConv1.outChannels));
     normActConv1.apply(cudaHandles,scratch,batchSize,false,trunkBuf,trunkScratchBuf,midIn.buf,maskBuf,workspaceBuf,workspaceBytes);
     normActConv2.apply(cudaHandles,scratch,batchSize,true,midIn.buf,midScratch.buf,trunkBuf,maskBuf,workspaceBuf,workspaceBytes);
+    if(postBN != nullptr)
+      postBN->apply(cudaHandles,batchSize,trunkBuf,maskBuf,trunkBuf);
   }
 
 };
@@ -3504,7 +3513,7 @@ BlockStack::BlockStack(
 {
   testAssert(numBlocks == descBlocks.size());
   for(int i = 0; i<numBlocks; i++) {
-    if(descBlocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(descBlocks[i].first == ORDINARY_BLOCK_KIND || descBlocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* blockDesc = (ResidualBlockDesc*)descBlocks[i].second.get();
       unique_ptr_void blockPtr = make_unique_void(
         new ResidualBlock(
@@ -3517,7 +3526,7 @@ BlockStack::BlockStack(
           useNHWC
         )
       );
-      blocks.emplace_back(ORDINARY_BLOCK_KIND,std::move(blockPtr));
+      blocks.emplace_back(descBlocks[i].first,std::move(blockPtr));
     }
     else if(descBlocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
       GlobalPoolingResidualBlockDesc* blockDesc = (GlobalPoolingResidualBlockDesc*)descBlocks[i].second.get();
@@ -3593,7 +3602,7 @@ size_t BlockStack::requiredWorkspaceBytes(
   size_t b;
 
   for(int i = 0; i<blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlock* block = (ResidualBlock*)blocks[i].second.get();
       b = block->requiredWorkspaceBytes(cudaHandles,batchSize);
       bytes = std::max(bytes,b);
@@ -3664,7 +3673,7 @@ void BlockStack::apply(
     CudaUtils::debugPrint3D(KATAGO_GPU_BACKEND_NAME " Blockstack block " + Global::intToString(i), trunkBuf, batchSize, trunkNumChannels, nnXLen*nnYLen, usingNHWC, usingFP16, maskBuf);
 #endif
 
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       flushPendingDelta();
       ResidualBlock* block = (ResidualBlock*)blocks[i].second.get();
       block->apply(
@@ -4088,6 +4097,9 @@ static void fillMaskFloatBufAndMaskSumBuf(CudaHandles* cudaHandles, void* maskBu
 struct PolicyHead {
   const string name;
   const int modelVersion;
+  //mv18 and later: if true, use the Leela-Zero-style full policy matmul (pFullMul) instead of
+  //the p2Conv + global pooling pass path.
+  const bool hasFullPolicyMul;
   const int nnXLen;
   const int nnYLen;
   const int p1Channels;
@@ -4101,6 +4113,13 @@ struct PolicyHead {
   const BatchNormLayer g1BN;
   const MatMulLayer gpoolToBiasMul;
   const BatchNormLayer p1BN;
+  //pFullMul is split into a spatial part that writes the policy logits directly and a small pass
+  //part, because the policy buffer holds exactly nnXLen*nnYLen logits per batch element with no
+  //room for the extra pass logit. Values are identical to one (numSpatial+1)-column GEMM.
+  std::unique_ptr<MatMulLayer> pFullMulMain;
+  std::unique_ptr<MatBiasLayer> pFullMulBiasMain;
+  std::unique_ptr<MatMulLayer> pFullMulPass;
+  std::unique_ptr<MatBiasLayer> pFullMulBiasPass;
   const ConvLayer p2Conv;
   const MatMulLayer gpoolToPassMul;
   const MatBiasLayer gpoolToPassBias;
@@ -4121,6 +4140,7 @@ struct PolicyHead {
   ) :
     name(desc->name),
     modelVersion(desc->modelVersion),
+    hasFullPolicyMul(desc->hasFullPolicyMul),
     nnXLen(nnX),
     nnYLen(nnY),
     p1Channels(desc->p1Conv.outChannels),
@@ -4138,6 +4158,57 @@ struct PolicyHead {
     gpoolToPassBias(cudaHandles,&desc->gpoolToPassBias,false,desc->passActivation.activation),
     gpoolToPassMul2(cudaHandles,&desc->gpoolToPassMul2,false)
   {
+    if(hasFullPolicyMul) {
+      //pFullMul consumes the flattened spatial p1Activation output in position-major,
+      //channel-minor order, which only the NHWC activation layout provides.
+      if(!useNHWC)
+        throw StringError("CUDA/ROCm backend: LZ-style full policy matmul requires NHWC activation layout");
+      const int numSpatial = nnX * nnY;
+      const int poc = p2Channels;
+      const int fullOut = desc->pFullMul.outChannels;
+      const int inC = desc->pFullMul.inChannels;
+      testAssert(inC == p1Channels * numSpatial);
+      testAssert(fullOut == poc * (numSpatial + 1));
+      testAssert((int)desc->pFullMul.weights.size() == (size_t)inC * fullOut);
+      testAssert(desc->pFullMulBias.numChannels == fullOut);
+
+      MatMulLayerDesc mainDesc;
+      mainDesc.name = desc->pFullMul.name + ".main";
+      mainDesc.inChannels = inC;
+      mainDesc.outChannels = numSpatial * poc;
+      mainDesc.weights.resize((size_t)inC * mainDesc.outChannels);
+      for(int ic = 0; ic < inC; ic++)
+        for(int oc = 0; oc < mainDesc.outChannels; oc++)
+          mainDesc.weights[(size_t)ic * mainDesc.outChannels + oc] = desc->pFullMul.weights[(size_t)ic * fullOut + oc];
+      MatBiasLayerDesc mainBiasDesc;
+      mainBiasDesc.name = desc->pFullMulBias.name + ".main";
+      mainBiasDesc.numChannels = mainDesc.outChannels;
+      mainBiasDesc.weights.assign(
+        desc->pFullMulBias.weights.begin(),
+        desc->pFullMulBias.weights.begin() + mainDesc.outChannels
+      );
+
+      MatMulLayerDesc passDesc;
+      passDesc.name = desc->pFullMul.name + ".pass";
+      passDesc.inChannels = inC;
+      passDesc.outChannels = poc;
+      passDesc.weights.resize((size_t)inC * poc);
+      for(int ic = 0; ic < inC; ic++)
+        for(int c = 0; c < poc; c++)
+          passDesc.weights[(size_t)ic * poc + c] = desc->pFullMul.weights[(size_t)ic * fullOut + mainDesc.outChannels + c];
+      MatBiasLayerDesc passBiasDesc;
+      passBiasDesc.name = desc->pFullMulBias.name + ".pass";
+      passBiasDesc.numChannels = poc;
+      passBiasDesc.weights.assign(
+        desc->pFullMulBias.weights.begin() + mainDesc.outChannels,
+        desc->pFullMulBias.weights.end()
+      );
+
+      pFullMulMain = std::make_unique<MatMulLayer>(cudaHandles,&mainDesc,false);
+      pFullMulBiasMain = std::make_unique<MatBiasLayer>(cudaHandles,&mainBiasDesc,false,ACTIVATION_IDENTITY);
+      pFullMulPass = std::make_unique<MatMulLayer>(cudaHandles,&passDesc,false);
+      pFullMulBiasPass = std::make_unique<MatBiasLayer>(cudaHandles,&passBiasDesc,false,ACTIVATION_IDENTITY);
+    }
   }
 
   ~PolicyHead()
@@ -4192,6 +4263,36 @@ struct PolicyHead {
     SizedBuf<void*> p1Pass(scratch->allocator, scratch->getBufSizeFloat(p1Channels));
 
     p1Conv.apply(cudaHandles,scratch,batchSize,false,trunkBuf,p1Out.buf,workspaceBuf,workspaceBytes);
+
+    if(hasFullPolicyMul) {
+      //Leela-Zero-style policy head: p1Conv -> p1BN(+ReLU) -> flatten -> pFullMul -> bias.
+      //The internals run NHWC (enforced for LZ models in createComputeHandle), so p1BN's output
+      //is position-major channel-minor per batch, exactly the flattened vector pFullMul expects.
+      float* p1BnIn;
+      float* p1BnOut;
+      if(!usingFP16) {
+        p1BnIn = (float*)p1Out.buf;
+        p1BnOut = (float*)p1Out2.buf;
+      }
+      else {
+        customCudaCopyFromHalf((const half*)p1Out.buf,(float*)p1Out2.buf,batchSize*p1Channels*nnXLen*nnYLen,cudaHandles->stream);
+        CUDA_ERR(name.c_str(),cudaPeekAtLastError());
+        p1BnIn = (float*)p1Out2.buf;
+        p1BnOut = (float*)p1Out.buf;
+      }
+      p1BN.apply(cudaHandles,batchSize,p1BnIn,maskFloatBuf,p1BnOut);
+      pFullMulMain->apply(cudaHandles,scratch,batchSize,p1BnOut,policyBuf,workspaceBuf,workspaceBytes);
+      pFullMulBiasMain->apply(cudaHandles,batchSize,policyBuf);
+      pFullMulPass->apply(cudaHandles,scratch,batchSize,p1BnOut,policyPassBuf,workspaceBuf,workspaceBytes);
+      pFullMulBiasPass->apply(cudaHandles,batchSize,policyPassBuf);
+
+      #ifdef DEBUG_INTERMEDIATE_VALUES
+      CudaUtils::debugPrint3D(string("p1 after-fullmul"), p1BnOut, batchSize, p1Channels, nnXLen*nnYLen, usingNHWC, false);
+      CudaUtils::debugPrint2D(string("policypass"), policyPassBuf, batchSize, 1, false);
+      #endif
+      return;
+    }
+
     g1Conv.apply(cudaHandles,scratch,batchSize,false,trunkBuf,g1Out.buf,workspaceBuf,workspaceBytes);
     g1BN.apply(cudaHandles,batchSize,g1Out.buf,maskBuf,g1Out2.buf);
 
@@ -4267,6 +4368,9 @@ struct PolicyHead {
 struct ValueHead {
   const string name;
   const int modelVersion;
+  //mv18 and later: if true, v2Mul consumes the flattened spatial v1Activation output directly
+  //instead of the 3 global pooling statistics (Leela-Zero-style value head).
+  const bool hasFullValueMul;
   const int nnXLen;
   const int nnYLen;
   const int v1Channels;
@@ -4302,6 +4406,7 @@ struct ValueHead {
   ) :
     name(desc->name),
     modelVersion(desc->modelVersion),
+    hasFullValueMul(desc->hasFullValueMul),
     nnXLen(nnX),
     nnYLen(nnY),
     v1Channels(desc->v1Conv.outChannels),
@@ -4321,6 +4426,8 @@ struct ValueHead {
     sv3Bias(cudaHandles,&desc->sv3Bias,false,ACTIVATION_IDENTITY),
     vOwnershipConv(cudaHandles,manager,&desc->vOwnershipConv,useFP16,useNHWC)
   {
+    if(hasFullValueMul && v1Channels > 1 && !useNHWC)
+      throw StringError("CUDA/ROCm backend: LZ-style full value matmul requires NHWC activation layout");
   }
 
   ~ValueHead()
@@ -4376,20 +4483,34 @@ struct ValueHead {
     v1Conv.apply(cudaHandles,scratch,batchSize,false,trunkBuf,v1Out.buf,workspaceBuf,workspaceBytes);
     v1BN.apply(cudaHandles,batchSize,v1Out.buf,maskBuf,v1Out2.buf);
 
-    void* bufToBePooled = v1Out2.buf;
-    if(usingFP16) {
-      customCudaCopyFromHalf((const half*)v1Out2.buf,(float*)workspaceBuf,batchSize*v1Channels*nnXLen*nnYLen,cudaHandles->stream);
-      CUDA_ERR(name.c_str(),cudaPeekAtLastError());
-      bufToBePooled = workspaceBuf;
+    if(hasFullValueMul) {
+      //Leela-Zero-style value head: flatten v1Activation and feed it straight to v2Mul, skipping
+      //the global pooling statistics. LZ nets have v1Conv.outChannels == 1, so the activation
+      //block is already the position-major vector v2Mul expects regardless of NHWC/NCHW.
+      void* v1FlatBuf = v1Out2.buf;
+      if(usingFP16) {
+        customCudaCopyFromHalf((const half*)v1Out2.buf,(float*)workspaceBuf,batchSize*v1Channels*nnXLen*nnYLen,cudaHandles->stream);
+        CUDA_ERR(name.c_str(),cudaPeekAtLastError());
+        v1FlatBuf = workspaceBuf;
+      }
+      v2Mul.apply(cudaHandles,scratch,batchSize,v1FlatBuf,v2Out.buf,workspaceBuf,workspaceBytes);
     }
+    else {
+      void* bufToBePooled = v1Out2.buf;
+      if(usingFP16) {
+        customCudaCopyFromHalf((const half*)v1Out2.buf,(float*)workspaceBuf,batchSize*v1Channels*nnXLen*nnYLen,cudaHandles->stream);
+        CUDA_ERR(name.c_str(),cudaPeekAtLastError());
+        bufToBePooled = workspaceBuf;
+      }
 
-    if(!usingNHWC)
-      customCudaValueHeadPoolNCHW((float*)bufToBePooled,(float*)v1Mean.buf,batchSize,v1Channels,nnXLen*nnYLen,maskSumBuf,cudaHandles->stream);
-    else
-      customCudaValueHeadPoolNHWC((const float*)bufToBePooled,(float*)v1Mean.buf,batchSize,nnXLen*nnYLen,v1Channels,maskSumBuf,cudaHandles->stream);
-    CUDA_ERR(name.c_str(),cudaPeekAtLastError());
+      if(!usingNHWC)
+        customCudaValueHeadPoolNCHW((float*)bufToBePooled,(float*)v1Mean.buf,batchSize,v1Channels,nnXLen*nnYLen,maskSumBuf,cudaHandles->stream);
+      else
+        customCudaValueHeadPoolNHWC((const float*)bufToBePooled,(float*)v1Mean.buf,batchSize,nnXLen*nnYLen,v1Channels,maskSumBuf,cudaHandles->stream);
+      CUDA_ERR(name.c_str(),cudaPeekAtLastError());
 
-    v2Mul.apply(cudaHandles,scratch,batchSize,v1Mean.buf,v2Out.buf,workspaceBuf,workspaceBytes);
+      v2Mul.apply(cudaHandles,scratch,batchSize,v1Mean.buf,v2Out.buf,workspaceBuf,workspaceBytes);
+    }
     v2Bias.apply(cudaHandles,batchSize,v2Out.buf);
     v3Mul.apply(cudaHandles,scratch,batchSize,v2Out.buf,valueBuf,workspaceBuf,workspaceBytes);
     v3Bias.apply(cudaHandles,batchSize,valueBuf);
@@ -5145,6 +5266,15 @@ ComputeHandle* NeuralNet::createComputeHandle(
     useNHWC = true;
   }
 
+  //LZ-style models (LZConverter) use full spatial matmuls for the policy and value heads, which
+  //consume the activation in position-major channel-minor order. Only NHWC internals provide that
+  //order for p1Conv's multi-channel output, so force NHWC like transformer models do.
+  if(!useNHWC && loadedModel->modelDesc.isLZModel) {
+    if(context->useNHWCMode == enabled_t::False)
+      throw StringError("CUDA backend: LZ models require NHWC, but cudaUseNHWC=false was set");
+    useNHWC = true;
+  }
+
   if(logger != NULL) {
     logger->write(
       "Cuda backend thread " + Global::intToString(serverThreadIdx) + ": Found GPU " + string(prop.name)
@@ -5222,6 +5352,13 @@ ComputeHandle* NeuralNet::createComputeHandle(
   if(!useNHWC && loadedModel->modelDesc.trunk.hasAnyTransformerBlocks()) {
     if(context->useNHWCMode == enabled_t::False)
       throw StringError("ROCm backend: transformer models require NHWC, but rocmUseNHWC=false was set");
+    useNHWC = true;
+  }
+
+  //LZ-style models need NHWC internals for their full spatial head matmuls; see the CUDA backend.
+  if(!useNHWC && loadedModel->modelDesc.isLZModel) {
+    if(context->useNHWCMode == enabled_t::False)
+      throw StringError("ROCm backend: LZ models require NHWC, but rocmUseNHWC=false was set");
     useNHWC = true;
   }
 
