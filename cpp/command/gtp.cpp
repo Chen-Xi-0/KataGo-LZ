@@ -2183,8 +2183,11 @@ int MainCmds::gtp(const vector<string>& args) {
     //Analysis mode ignores these by design, so analysis-based strength testing does not
     //see them; genmove play without this gets randomized away from the best move. cfg
     //explicit values still win. nnRandomize is handled in Setup::initializeNNEvaluators.
-    if(!config.contains("nnRandomize")
-       && !config.contains("chosenMoveTemperature")
+    //NOTE: deliberately NOT gated on cfg's nnRandomize - passing nnRandomize=false (which
+    //lizzieyzy and every match script does) used to disable this block as a side effect, leaving
+    //genmove sampling at the 0.1/0.5 temperature defaults while analysis mode ignored it. That is
+    //exactly the "genmove looks weaker than analysis at equal compute" trap.
+    if(!config.contains("chosenMoveTemperature")
        && !config.contains("chosenMoveTemperatureEarly")
        && Setup::isLZWeightFile(nnModelFile)) {
       genmoveOut.chosenMoveTemperature = 0.0;
