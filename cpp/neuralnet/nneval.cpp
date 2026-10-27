@@ -1127,11 +1127,12 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
 
 namespace LzLadder {
   Params params;
+  std::atomic<int> rootArmed(0);
   Params::Params()
     : enabled(true), minStones(1), valueBlend(0.8), maxPlies(40),
       checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
       boostFactor(2.0), defenseDepth(11), offenseEnabled(true), offenseDepth(8),
-      boostWinrate(0.3), penaltyWinrate(0.9), ladderMaxNodes(4000) {}
+      boostWinrate(0.3), penaltyWinrate(0.9), ladderMaxNodes(4000), ladderValueBlend(0.8) {}
 }
 
 //The value override lives one level up (evaluateWithLzLadder): calling evaluate() from inside
@@ -2120,9 +2121,95 @@ void NNEvaluator::evaluateWithLzLadder(
   bool skipCache,
   bool includeOwnerMap
 ) {
-  //Reference-fork fidelity: the whole ladder correction is a POLICY surgery on the network output
-  //(applyLZLadderCorrectionV5). No tree-value override, hence no extra network call per node.
   evaluate(board, history, nextPlayer, sgfMeta, nnInputParams, buf, skipCache, includeOwnerMap);
+
+  //Value half of the ladder correction, gated to the exact state where it matters: the opponent
+  //(the side that is NOT to move) has a group with exactly two liberties and the depth solver -
+  //with US moving first - says it cannot be run down. That is precisely "their escape already
+  //happened": policy alone is not enough there, because the boosted move gets searched first but
+  //the ladder-blind value head still calls two liberties "dead" and the search drops it again
+  //(measured on the yin-zheng position: escape prior 0.37% -> 30.5%, value 52.3% vs 10b's 77.0%).
+  //The correction prices the escaped board: give the defender the extension it is entitled to and
+  //evaluate that, so the node value reflects a live group. Only fires on genuine two-liberty
+  //ladder shapes, so it cannot disturb ordinary positions.
+  if(!isLZModelFlag || !LzLadder::params.enabled || getenv("LZ_NO_LADDER") != NULL)
+    return;
+  if(buf.result == NULL)
+    return;
+  if(board.ko_loc != Board::NULL_LOC)
+    return;
+  const LzLadder::Params& P = LzLadder::params;
+  if((float)P.ladderValueBlend <= 0.0f)
+    return;
+  //Only while the current search's ROOT contains a ladder shape (see rootArmed). This keeps every
+  //ordinary search free of the extra solver calls.
+  if(LzLadder::rootArmed.load(std::memory_order_relaxed) == 0)
+    return;
+  {
+    const Player opp = getOpp(nextPlayer);
+    vector<Loc> buf2;
+    vector<Loc> buf3;
+    for(int y = 0; y < board.y_size; y++) {
+      for(int x = 0; x < board.x_size; x++) {
+        Loc loc = Location::getLoc(x,y,board.x_size);
+        if(board.colors[loc] != opp)
+          continue;
+        if(board.chain_head[loc] != loc)
+          continue;
+        if(board.getNumLiberties(loc) != 2)
+          continue;
+        if(board.getChainSize(loc) < P.minStones)
+          continue;
+        int d = 0;
+        Board probe(board);
+        if(probe.searchIsLadderCaptured(loc,false,buf2,&d))
+          continue;   //we can still capture it: nothing to correct
+        //The group is out. Give it the extension at one of its liberties and evaluate that board.
+        Loc lib = Board::NULL_LOC;
+        {
+          Loc head = board.chain_head[loc];
+          for(int yy = 0; yy < board.y_size && lib == Board::NULL_LOC; yy++) {
+            for(int xx = 0; xx < board.x_size; xx++) {
+              if(board.chain_head[Location::getLoc(xx,yy,board.x_size)] != head)
+                continue;
+              for(int dd = 0; dd < 4; dd++) {
+                const int nx = xx + (dd==0?1:dd==1?-1:0);
+                const int ny = yy + (dd==2?1:dd==3?-1:0);
+                if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
+                  continue;
+                Loc nb = Location::getLoc(nx,ny,board.x_size);
+                if(board.colors[nb] == C_EMPTY) { lib = nb; break; }
+              }
+              if(lib != Board::NULL_LOC) break;
+            }
+          }
+        }
+        if(lib == Board::NULL_LOC)
+          continue;
+        Board trial(board);
+        BoardHistory trialHist(history);
+        if(!trialHist.makeBoardMoveTolerant(trial,lib,opp))
+          continue;
+        MiscNNInputParams endParams = nnInputParams;
+        endParams.symmetry = 0;
+        NNResultBuf endBuf;
+        try {
+          evaluate(trial, trialHist, nextPlayer, sgfMeta, endParams, endBuf, false, false);
+          const float dEnd = endBuf.result->whiteWinProb;
+          const float blend = (float)P.ladderValueBlend;
+          const float blended = (1.0f - blend) * buf.result->whiteWinProb + blend * dEnd;
+          if(getenv("LZ_LADDER_DEBUG") != NULL)
+            std::fprintf(stderr, "[LADVE] escaped-group value raw=%.4f end=%.4f -> %.4f\n",
+              buf.result->whiteWinProb, dEnd, blended);
+          buf.result->whiteWinProb = blended;
+          buf.result->whiteLossProb = 1.0f - blended - buf.result->whiteNoResultProb;
+        }
+        catch(const std::exception&) {
+        }
+        return;
+      }
+    }
+  }
 }
 
 // Uncomment this to lower the effective hash size down to one where we get true collisions

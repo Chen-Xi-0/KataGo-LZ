@@ -1,3 +1,4 @@
+#include <atomic>
 #ifndef NEURALNET_NNEVAL_H_
 #define NEURALNET_NNEVAL_H_
 
@@ -87,10 +88,15 @@ namespace LzLadder {
     double boostWinrate; //lzLadderBoostWinrate: winrate nudge factor on a boosted capture
     double penaltyWinrate;//lzLadderPenaltyWinrate: winrate nudge factor on a penalty
     int ladderMaxNodes;  //lzLadderMaxNodes: node budget of the depth solver (reference 25000)
+    double ladderValueBlend;//lzLadderEscapedValueBlend: blend for a solver-certified escaped group
 
     Params();
   };
   extern Params params;
+  //Set by the search when the ROOT position contains a ladder-relevant shape (a group with one or
+  //two liberties whose solver verdict matters). The escaped-group value correction only runs while
+  //this is set, so ordinary searches pay nothing for it.
+  extern std::atomic<int> rootArmed;
 }
 
 // Result of NNEvaluator::benchmarkPureForward
