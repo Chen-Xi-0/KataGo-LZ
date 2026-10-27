@@ -1130,7 +1130,8 @@ namespace LzLadder {
   Params::Params()
     : enabled(true), minStones(1), valueBlend(0.8), maxPlies(40),
       checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
-      boostFactor(1.5), defenseDepth(4), offenseEnabled(true), offenseDepth(8) {}
+      boostFactor(1.5), defenseDepth(4), offenseEnabled(true), offenseDepth(8),
+      boostWinrate(0.0), penaltyWinrate(0.9) {}
 }
 
 //The value override lives one level up (evaluateWithLzLadder): calling evaluate() from inside
@@ -1376,7 +1377,8 @@ static void applyLZLadderCorrectionV5(
   int nnXLen,
   int nnYLen,
   float* policy,
-  const bool* isLegal
+  const bool* isLegal,
+  float* winMulOut
 ) {
   const LzLadder::Params& P = LzLadder::params;
   const int policySize = NNPos::getPolicySize(nnXLen,nnYLen);
@@ -1544,8 +1546,23 @@ static void applyLZLadderCorrectionV5(
 
     if(doBoost && (float)P.boostFactor > 1.0f) {
       const float boostLogit = maxLogit + std::log((float)P.boostFactor);
-      if(boostLogit > policy[pos])
+      if(boostLogit > policy[pos]) {
+        //Reference winrate surgery: the winrate change is scaled by the move's own probability
+        //(a low-prior move gets a small nudge, a high-prior one a bigger one), so the position
+        //value stays honest. Original probability is logit-space softmax over legal moves.
+        if(winMulOut != NULL && P.boostWinrate > 0.0f) {
+          float sum = 0.0f;
+          for(int q = 0; q < policySize; q++) {
+            if(isLegal[q])
+              sum += std::exp(policy[q] - maxLogit);
+          }
+          if(sum > 0.0f) {
+            const float p = std::exp(policy[pos] - maxLogit) / sum;
+            *winMulOut *= (1.0f + p * (float)P.boostWinrate);
+          }
+        }
         policy[pos] = boostLogit;
+      }
     }
     else if(doDemote) {
       //Same as the previous chase rule: zero the prior outright. A soft demotion does not change
@@ -1589,6 +1606,7 @@ void NNEvaluator::evaluate(
 ) {
   testAssert(!isKilled);
   buf.hasResult = false;
+  float ladderWinMul = 1.0f;   //multiplicative winrate nudge from the ladder boost (1.0 = none)
 
   if(board.x_size > nnXLen || board.y_size > nnYLen)
     throw StringError("NNEvaluator was configured with nnXLen = " + Global::intToString(nnXLen) +
@@ -1724,7 +1742,7 @@ void NNEvaluator::evaluate(
     //evaluateWithLzLadder. Native KataGo nets unaffected.
     //LZ_NO_LADDER=1 skips it entirely (A/B experiment switch for strength testing).
     if(isLZModelFlag && LzLadder::params.enabled && getenv("LZ_NO_LADDER") == NULL)
-      applyLZLadderCorrectionV5(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal);
+      applyLZLadderCorrectionV5(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal,&ladderWinMul);
 
     //The correction can change which logit is the largest, so recompute the softmax reference.
     maxPolicy = -1e25f;
@@ -2005,6 +2023,15 @@ void NNEvaluator::evaluate(
     else {
       throw StringError("NNEval value postprocessing not implemented for model version");
     }
+  }
+
+  //Ladder boost's winrate surgery (see applyLZLadderCorrectionV5): multiplicative, in
+  //side-to-move terms, so it commutes with the white/black perspective of whiteWinProb.
+  if(ladderWinMul != 1.0f) {
+    float stmWin = (nextPlayer == P_WHITE) ? buf.result->whiteWinProb : (1.0f - buf.result->whiteWinProb);
+    stmWin = std::min(1.0f, std::max(0.0f, stmWin * ladderWinMul));
+    buf.result->whiteWinProb = (nextPlayer == P_WHITE) ? stmWin : (1.0f - stmWin);
+    buf.result->whiteLossProb = 1.0f - buf.result->whiteWinProb - buf.result->whiteNoResultProb;
   }
 
   // And record the nnHash in the result and put it into the table

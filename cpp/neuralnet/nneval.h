@@ -84,6 +84,8 @@ namespace LzLadder {
     int defenseDepth;    //lzLadderDefenseDepth: min plies of the losing line before demotion
     bool offenseEnabled; //lzLadderOffenseEnabled: enable the futile-chase zeroing
     int offenseDepth;    //lzLadderOffenseDepth: chase length that counts as futile
+    double boostWinrate; //lzLadderBoostWinrate: winrate nudge factor on a boosted capture
+    double penaltyWinrate;//lzLadderPenaltyWinrate: winrate nudge factor on a penalty
 
     Params();
   };
