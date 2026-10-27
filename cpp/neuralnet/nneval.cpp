@@ -1129,246 +1129,104 @@ namespace LzLadder {
   Params params;
   std::atomic<int> rootArmed(0);
   Params::Params()
-    : enabled(true), minStones(1), valueBlend(0.8), maxPlies(40),
+    : enabled(true), minStones(1),
       checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
-      boostFactor(2.0), defenseDepth(11), offenseEnabled(true), offenseDepth(8),
-      boostWinrate(0.3), penaltyWinrate(0.9), ladderMaxNodes(4000), ladderValueBlend(0.8) {}
+      boostFactor(2.0), defenseDepth(11), offenseEnabled(true), offenseDepth(6),
+      boostWinrate(0.3), minDepth(6), ladderValueBlend(0.8) {}
 }
 
-//The value override lives one level up (evaluateWithLzLadder): calling evaluate() from inside
-//the postprocessing of evaluate() deadlocks on the evaluator's internal locking, so the ladder
-//end-position must be evaluated as a clean sequential call after the main eval returns.
-
-//Play out the canonical ladder line on a solver-proven capturable two-liberty group.
-//The attacker (to move on startBoard) ataris via a solver working move that keeps the chase
-//alive; the defender answers by extending at the group's last liberty. Every attacker step
-//is re-certified by the solver, so the line can never diverge from a proven-capture path.
-//Returns true with endBoard/endHist set to the position after the capture (defender to move).
-//Limitation (documented in the design doc): the defender's counter-atari alternatives are
-//not simulated - the verdict is still exact (the solver proved capture against any defense),
-//only the precise end board may differ from the defender's best counter-play.
-static bool expandLadderLine(
-  const Board& startBoard, const BoardHistory& startHist, Player attacker, Loc groupLoc,
-  int maxPlies, Board& endBoard, BoardHistory& endHist, int* outPlies = NULL
-) {
-  const Player defender = getOpp(attacker);
-  vector<Loc> buf;
-  vector<Loc> workingMoves;
-  static const int NDX[4] = {1,-1,0,0};
-  static const int NDY[4] = {0,0,1,-1};
-  endBoard = startBoard;
-  endHist = startHist;
-
-  const bool trace = getenv("LZ_LADDER_DEBUG") != NULL;
-  auto traceMove = [&](const char* role, Player pla, Loc m, const Board& b) {
-    if(trace)
-      std::fprintf(stderr, "[LADT] %s %s %s\n", role, pla == P_BLACK ? "B" : "W",
-        Global::strprintf("%c%d", "ABCDEFGHJKLMNOPQRST"[Location::getX(m,b.x_size)], b.y_size - Location::getY(m,b.x_size)).c_str());
-  };
-
-  for(int plies = 0; plies < maxPlies; plies++) {
-    const int curLibs = endBoard.getNumLiberties(groupLoc);
-    if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
-      std::fprintf(stderr, "[LADX] ply=%d libs=%d\n", plies, curLibs);
-    if(curLibs == 0)
-      return false; //already captured: line no longer canonical
-    if(curLibs == 1) {
-      //Attacker to move on an atari'd group (the defender's last extension gained nothing):
-      //play the capture. Self-verifying: try every empty neighbor of every chain stone and
-      //accept only a move that actually removes the group from the board.
-      Loc head = endBoard.chain_head[groupLoc];
-      for(int y = 0; y < endBoard.y_size; y++) {
-        for(int x = 0; x < endBoard.x_size; x++) {
-          if(endBoard.chain_head[Location::getLoc(x,y,endBoard.x_size)] != head)
-            continue;
-          for(int d = 0; d<4; d++) {
-            int nx = x + NDX[d];
-            int ny = y + NDY[d];
-            if(nx < 0 || nx >= endBoard.x_size || ny < 0 || ny >= endBoard.y_size)
-              continue;
-            Loc nb = Location::getLoc(nx,ny,endBoard.x_size);
-            if(endBoard.colors[nb] != C_EMPTY)
-              continue;
-            Board t2(endBoard);
-            BoardHistory h2(endHist);
-            if(!h2.makeBoardMoveTolerant(t2, nb, attacker))
-              continue;
-            if(t2.colors[groupLoc] == C_EMPTY) {
-              endBoard = t2;
-              endHist = h2;
-              traceMove("ATK-CAP", attacker, nb, t2);
-              if(trace) std::fprintf(stderr, "[LADT] END captured\n");
-              if(outPlies != NULL) *outPlies = plies + 1;
-              return true;
-            }
-          }
-        }
-      }
-      if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
-        std::fprintf(stderr, "[LADX] ply=%d no-capture-move-worked\n", plies);
-      if(outPlies != NULL) *outPlies = plies + 1;
-      return false;
-    }
-    if(curLibs != 2) {
-      //escaped shape: line no longer canonical. Report how far it got - the caller uses this as
-      //the chase length ("how far does the defender run before the chase breaks").
-      if(outPlies != NULL) *outPlies = plies + 1;
-      return false;
-    }
-
-    //Attacker: pick a working move whose atari keeps the group captured-even-defending.
-    if(!endBoard.searchIsLadderCapturedAttackerFirst2Libs(groupLoc, buf, workingMoves)) {
-      if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
-        std::fprintf(stderr, "[LADX] ply=%d solver-refused\n", plies);
-      return false;
-    }
-    if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
-      std::fprintf(stderr, "[LADX] ply=%d wm=%zu\n", plies, workingMoves.size());
-    bool played = false;
-    for(Loc m: workingMoves) {
-      Board trial(endBoard);
-      BoardHistory trialHist(endHist);
-      if(!trialHist.makeBoardMoveTolerant(trial, m, attacker))
-        continue;
-      if(trial.getNumLiberties(groupLoc) != 1)
-        continue;
-      if(trial.searchIsLadderCaptured(groupLoc, true, buf)) {
-        endBoard = trial;
-        endHist = trialHist;
-        traceMove("ATK-ATARI", attacker, m, trial);
-        played = true;
-        break;
-      }
-    }
-    if(!played) {
-      if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
-        std::fprintf(stderr, "[LADX] ply=%d no-working-move-accepted\n", plies);
-      return false;
-    }
-
-    //Defender: extend at the group's last liberty (the ladder continuation). Self-verifying
-    //like the capture branch: try each empty chain-neighbor as the extension, and if none is
-    //legal for the defender, fall through to the attacker capture that ends the ladder.
-    {
-      Loc head = endBoard.chain_head[groupLoc];
-      bool extended = false;
-      for(int y = 0; y < endBoard.y_size && !extended; y++) {
-        for(int x = 0; x < endBoard.x_size && !extended; x++) {
-          if(endBoard.chain_head[Location::getLoc(x,y,endBoard.x_size)] != head)
-            continue;
-          for(int d = 0; d<4; d++) {
-            int nx = x + NDX[d];
-            int ny = y + NDY[d];
-            if(nx < 0 || nx >= endBoard.x_size || ny < 0 || ny >= endBoard.y_size)
-              continue;
-            Loc nb = Location::getLoc(nx,ny,endBoard.x_size);
-            if(endBoard.colors[nb] != C_EMPTY)
-              continue;
-            Board trial(endBoard);
-            BoardHistory trialHist(endHist);
-            if(trialHist.makeBoardMoveTolerant(trial, nb, defender)) {
-              const int extLibs = trial.getNumLiberties(nb);
-              if(extLibs >= 3)
-                continue; //not the ladder liberty or breaks out: keep looking
-              endBoard = trial;
-              endHist = trialHist;
-              traceMove("DEF-EXT", defender, nb, trial);
-              groupLoc = nb; //follow the extended chain
-              extended = true;
-              break;
-            }
-          }
-        }
-      }
-      if(extended)
-        continue; //next ply: attacker moves again
-
-      //No legal extension (suicide etc.): the attacker captures at a liberty, ladder ends.
-      for(int y = 0; y < endBoard.y_size; y++) {
-        for(int x = 0; x < endBoard.x_size; x++) {
-          if(endBoard.chain_head[Location::getLoc(x,y,endBoard.x_size)] != head)
-            continue;
-          for(int d = 0; d<4; d++) {
-            int nx = x + NDX[d];
-            int ny = y + NDY[d];
-            if(nx < 0 || nx >= endBoard.x_size || ny < 0 || ny >= endBoard.y_size)
-              continue;
-            Loc nb = Location::getLoc(nx,ny,endBoard.x_size);
-            if(endBoard.colors[nb] != C_EMPTY)
-              continue;
-            Board t2(endBoard);
-            BoardHistory h2(endHist);
-            if(!h2.makeBoardMoveTolerant(t2, nb, attacker))
-              continue;
-            if(t2.colors[groupLoc] == C_EMPTY) {
-              endBoard = t2;
-              endHist = h2;
-              return true;
-            }
-          }
-        }
-      }
-      if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
-        std::fprintf(stderr, "[LADX] ply=%d defender-branch-dead-end\n", plies);
-      return false;
-    }
-  }
-  if(outPlies != NULL) *outPlies = maxPlies;
-  return false;
-}
-
-//Runs on the raw policy logits, before the softmax; the legality mask is already in place,
-//so demotions keep the output a valid distribution after renormalization. Policy surgery
-//only - the value override is done by evaluateWithLzLadder one level up.
-//
-//Coordinate note: fillRowV8 writes the LZ-style planes bottom-origin, but this function works
-//in KataGo's board coordinates via NNPos::posToLoc / locToPos, which are top-origin. The
-//pos<->loc mapping is therefore self-consistent here (both directions go through the same
-//helpers), and no extra flip is needed.
-//Measures the ladder chase for an opponent group (defender to move): the defender extends at its
-//only liberty, then the attacker chases with expandLadderLine. Returns true when the attacker
-//captures, false when the defender gets out; *outPlies is the number of plies played either way
-//(for the escape case it is "how far the defender runs before the chase breaks").
-static bool measureChaseFromDefenderTurn(
-  const Board& board, const BoardHistory& history, Player attacker, Loc groupLoc,
-  int maxPlies, int* outPlies
-) {
-  if(outPlies != NULL) *outPlies = 0;
-  if(board.getNumLiberties(groupLoc) != 1)
-    return board.getNumLiberties(groupLoc) == 0;
-  const Player defender = getOpp(attacker);
-  Loc lib = Board::NULL_LOC;
-  {
-    const int xSize = board.x_size;
-    Loc head = board.chain_head[groupLoc];
-    for(int y = 0; y < board.y_size && lib == Board::NULL_LOC; y++) {
-      for(int x = 0; x < xSize; x++) {
-        if(board.chain_head[Location::getLoc(x,y,xSize)] != head)
+//Shared certification predicates. The reference fork centralizes "is this a ladder escape"
+//in LadderDetection; the boost, the root arming scan and the escaped-group value blend all need
+//the same answer, so they call into one place instead of re-deriving it.
+namespace LzLadder {
+  //First empty liberty of the chain, plus how many empty neighbors the chain has in total.
+  static Loc findChainLiberty(const Board& board, Loc loc, int* outNumEmpty) {
+    Loc lib = Board::NULL_LOC;
+    int numEmpty = 0;
+    Loc head = board.chain_head[loc];
+    for(int y = 0; y < board.y_size; y++) {
+      for(int x = 0; x < board.x_size; x++) {
+        if(board.chain_head[Location::getLoc(x,y,board.x_size)] != head)
           continue;
-        for(int d = 0; d<4; d++) {
+        for(int d = 0; d < 4; d++) {
           const int nx = x + (d==0?1:d==1?-1:0);
           const int ny = y + (d==2?1:d==3?-1:0);
-          if(nx < 0 || nx >= xSize || ny < 0 || ny >= board.y_size)
+          if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
             continue;
-          Loc nb = Location::getLoc(nx,ny,xSize);
-          if(board.colors[nb] == C_EMPTY) { lib = nb; break; }
+          Loc nb = Location::getLoc(nx,ny,board.x_size);
+          if(board.colors[nb] != C_EMPTY)
+            continue;
+          numEmpty++;
+          if(lib == Board::NULL_LOC)
+            lib = nb;
         }
-        if(lib != Board::NULL_LOC) break;
       }
     }
+    if(outNumEmpty != NULL) *outNumEmpty = numEmpty;
+    return lib;
   }
-  if(lib == Board::NULL_LOC)
+
+  bool isRealLadderEscape(
+    const Board& board, const BoardHistory& history, Loc loc, Player pla,
+    int minStones, int minDepth, Loc* outMove, int* outDepth
+  ) {
+    if(outMove != NULL) *outMove = Board::NULL_LOC;
+    if(outDepth != NULL) *outDepth = 0;
+    if(loc < 0 || loc >= Board::MAX_ARR_SIZE || board.colors[loc] != pla)
+      return false;
+    if(board.chain_head[loc] != loc)
+      return false;
+    if(board.getNumLiberties(loc) != 1 || board.getChainSize(loc) < minStones)
+      return false;
+    int numEmpty = 0;
+    Loc lib = findChainLiberty(board, loc, &numEmpty);
+    if(lib == Board::NULL_LOC || numEmpty != 1)
+      return false;
+    Board trial(board);
+    BoardHistory trialHist(history);
+    if(!trialHist.makeBoardMoveTolerant(trial,lib,pla))
+      return false;
+    if(trial.ko_loc != Board::NULL_LOC)
+      return false;
+    if(trial.getNumLiberties(lib) != 2)
+      return false;
+    vector<Loc> buf;
+    int d = 0;
+    if(trial.searchIsLadderCaptured(lib,false,buf,&d))
+      return false;
+    //Depth 0 means the solver ran out of its fixed node budget (upstream's 25000): the verdict is
+    //unknown. The depth also tells how long the chase is; only long ladders need the value
+    //correction, short ones are visible to the net and to a shallow search.
+    if(d < minDepth)
+      return false;
+    if(outMove != NULL) *outMove = lib;
+    if(outDepth != NULL) *outDepth = d;
     return true;
-  Board trial(board);
-  BoardHistory trialHist(history);
-  if(!trialHist.makeBoardMoveTolerant(trial,lib,defender))
+  }
+
+  bool isEscapedTwoLibertyGroup(
+    const Board& board, Loc loc, Player pla, int minStones, int minDepth,
+    Loc* outMove, int* outDepth
+  ) {
+    if(outMove != NULL) *outMove = Board::NULL_LOC;
+    if(outDepth != NULL) *outDepth = 0;
+    if(loc < 0 || loc >= Board::MAX_ARR_SIZE || board.colors[loc] != pla)
+      return false;
+    if(board.chain_head[loc] != loc)
+      return false;
+    if(board.getNumLiberties(loc) != 2 || board.getChainSize(loc) < minStones)
+      return false;
+    vector<Loc> buf;
+    int d = 0;
+    Board probe(board);
+    if(probe.searchIsLadderCaptured(loc,false,buf,&d))
+      return false;
+    if(d < minDepth)
+      return false;
+    if(outMove != NULL) *outMove = findChainLiberty(board, loc, NULL);
+    if(outDepth != NULL) *outDepth = d;
     return true;
-  Board endBoard;
-  BoardHistory endHist(trialHist);
-  int plies = 0;
-  const bool capturedLine = expandLadderLine(trial,trialHist,attacker,lib,maxPlies,endBoard,endHist,&plies);
-  if(outPlies != NULL) *outPlies = plies + 1;
-  return capturedLine;
+  }
 }
 
 static void applyLZLadderCorrectionV5(
@@ -1425,49 +1283,15 @@ static void applyLZLadderCorrectionV5(
       if(boostLogit > policy[p])
         policy[p] = boostLogit;
     };
+    //Boost is the reference's prior lift for a capture that cannot escape. The reference has no
+    //depth threshold on it, so pass minDepth=1: only a known solver verdict is required (depth 0
+    //means the solver's node budget was exhausted).
     for(int y = 0; y < board.y_size; y++) {
       for(int x = 0; x < board.x_size; x++) {
         Loc loc = Location::getLoc(x,y,board.x_size);
-        if(board.colors[loc] != nextPlayer)
-          continue;
-        if(board.chain_head[loc] != loc)
-          continue;
-        if(board.getNumLiberties(loc) != 1)
-          continue;
-        if(board.getChainSize(loc) < P.minStones)
-          continue;
-        Loc lib = Board::NULL_LOC;
-        int numEmpty = 0;
-        {
-          Loc head = board.chain_head[loc];
-          for(int yy = 0; yy < board.y_size; yy++) {
-            for(int xx = 0; xx < board.x_size; xx++) {
-              if(board.chain_head[Location::getLoc(xx,yy,board.x_size)] != head)
-                continue;
-              for(int d = 0; d < 4; d++) {
-                const int nx = xx + (d==0?1:d==1?-1:0);
-                const int ny = yy + (d==2?1:d==3?-1:0);
-                if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
-                  continue;
-                Loc nb = Location::getLoc(nx,ny,board.x_size);
-                if(board.colors[nb] == C_EMPTY) { lib = nb; numEmpty++; }
-              }
-            }
-          }
-        }
-        if(numEmpty != 1 || lib == Board::NULL_LOC)
-          continue;
-        Board trial(board);
-        BoardHistory trialHist(history);
-        if(!trialHist.makeBoardMoveTolerant(trial,lib,nextPlayer))
-          continue;
-        if(trial.ko_loc != Board::NULL_LOC)
-          continue;
-        if(trial.getNumLiberties(lib) != 2)
-          continue;
-        int d = 0;
-        if(!trial.searchIsLadderCaptured(lib,false,buf,&d))
-          boostAt(lib);
+        Loc move = Board::NULL_LOC;
+        if(LzLadder::isRealLadderEscape(board, history, loc, nextPlayer, P.minStones, 1, &move, NULL))
+          boostAt(move);
       }
     }
   }
@@ -2130,8 +1954,9 @@ void NNEvaluator::evaluateWithLzLadder(
   //the ladder-blind value head still calls two liberties "dead" and the search drops it again
   //(measured on the yin-zheng position: escape prior 0.37% -> 30.5%, value 52.3% vs 10b's 77.0%).
   //The correction prices the escaped board: give the defender the extension it is entitled to and
-  //evaluate that, so the node value reflects a live group. Only fires on genuine two-liberty
-  //ladder shapes, so it cannot disturb ordinary positions.
+  //evaluate that, so the node value reflects a live group. Only LONG ladders qualify (remaining
+  //escape depth >= lzLadderMinDepth): a short escape reaches three liberties within a move or two
+  //and the value head already sees it.
   if(!isLZModelFlag || !LzLadder::params.enabled || getenv("LZ_NO_LADDER") != NULL)
     return;
   if(buf.result == NULL)
@@ -2147,45 +1972,20 @@ void NNEvaluator::evaluateWithLzLadder(
     return;
   {
     const Player opp = getOpp(nextPlayer);
-    vector<Loc> buf2;
-    vector<Loc> buf3;
     for(int y = 0; y < board.y_size; y++) {
       for(int x = 0; x < board.x_size; x++) {
         Loc loc = Location::getLoc(x,y,board.x_size);
-        if(board.colors[loc] != opp)
-          continue;
-        if(board.chain_head[loc] != loc)
-          continue;
-        if(board.getNumLiberties(loc) != 2)
-          continue;
-        if(board.getChainSize(loc) < P.minStones)
-          continue;
-        int d = 0;
-        Board probe(board);
-        if(probe.searchIsLadderCaptured(loc,false,buf2,&d))
-          continue;   //we can still capture it: nothing to correct
-        //The group is out. Give it the extension at one of its liberties and evaluate that board.
         Loc lib = Board::NULL_LOC;
-        {
-          Loc head = board.chain_head[loc];
-          for(int yy = 0; yy < board.y_size && lib == Board::NULL_LOC; yy++) {
-            for(int xx = 0; xx < board.x_size; xx++) {
-              if(board.chain_head[Location::getLoc(xx,yy,board.x_size)] != head)
-                continue;
-              for(int dd = 0; dd < 4; dd++) {
-                const int nx = xx + (dd==0?1:dd==1?-1:0);
-                const int ny = yy + (dd==2?1:dd==3?-1:0);
-                if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
-                  continue;
-                Loc nb = Location::getLoc(nx,ny,board.x_size);
-                if(board.colors[nb] == C_EMPTY) { lib = nb; break; }
-              }
-              if(lib != Board::NULL_LOC) break;
-            }
-          }
-        }
+        int d = 0;
+        //Same "real long-ladder escape" predicate as the boost and the root arming scan: the
+        //attacker may still be unable to run it down, and at least lzLadderMinDepth plies of
+        //chase must remain. Near the end of a long ladder the remaining depth falls below that,
+        //but then both sides only have forced moves and a shallow search sees the capture.
+        if(!LzLadder::isEscapedTwoLibertyGroup(board, loc, opp, P.minStones, P.minDepth, &lib, &d))
+          continue;
         if(lib == Board::NULL_LOC)
           continue;
+        const int chainSize = board.getChainSize(loc);
         Board trial(board);
         BoardHistory trialHist(history);
         if(!trialHist.makeBoardMoveTolerant(trial,lib,opp))
@@ -2199,8 +1999,8 @@ void NNEvaluator::evaluateWithLzLadder(
           const float blend = (float)P.ladderValueBlend;
           const float blended = (1.0f - blend) * buf.result->whiteWinProb + blend * dEnd;
           if(getenv("LZ_LADDER_DEBUG") != NULL)
-            std::fprintf(stderr, "[LADVE] escaped-group value raw=%.4f end=%.4f -> %.4f\n",
-              buf.result->whiteWinProb, dEnd, blended);
+            std::fprintf(stderr, "[LADVE] escaped-group d=%d size=%d raw=%.4f end=%.4f -> %.4f\n",
+              d, chainSize, buf.result->whiteWinProb, dEnd, blended);
           buf.result->whiteWinProb = blended;
           buf.result->whiteLossProb = 1.0f - blended - buf.result->whiteNoResultProb;
         }
@@ -2211,7 +2011,6 @@ void NNEvaluator::evaluateWithLzLadder(
     }
   }
 }
-
 // Uncomment this to lower the effective hash size down to one where we get true collisions
 // #define SIMULATE_TRUE_HASH_COLLISIONS
 

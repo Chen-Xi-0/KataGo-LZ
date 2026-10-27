@@ -67,15 +67,12 @@ struct NNResultBuf {
   NNResultBuf& operator=(const NNResultBuf& other) = delete;
 };
 
-//Parameters of the v5 LZ ladder correction (solver verdict + forced-line expansion +
-//same-net end-position evaluation). Loaded from cfg in setup.cpp; only takes effect for
-//LZ models (isLZModelFlag).
+//Parameters of the LZ ladder correction (solver verdict + policy surgery + escaped-group value
+//blend). Loaded from cfg in setup.cpp; only takes effect for LZ models (isLZModelFlag).
 namespace LzLadder {
   struct Params {
     bool enabled;        //lzLadderEnabled: master switch
-    int minStones;       //lzLadderMinStones: minimum chased-group size for the value override
-    double valueBlend;   //lzLadderValueBlend: 0..1 blend of the end-position winrate
-    int maxPlies;        //lzLadderMaxPlies: cap of the expanded ladder line
+    int minStones;       //lzLadderMinStones: minimum chased-group size
     int checkNodes;      //lzLadderCheckNodes: policy candidates checked for demotion
     double minPolicy;    //lzLadderMinPolicy: candidate policy floor (probability space)
     double policyFactor; //lzLadderPolicyFactor: demote-to factor below the penaltyRank move
@@ -86,8 +83,7 @@ namespace LzLadder {
     bool offenseEnabled; //lzLadderOffenseEnabled: enable the futile-chase zeroing
     int offenseDepth;    //lzLadderOffenseDepth: chase length that counts as futile
     double boostWinrate; //lzLadderBoostWinrate: winrate nudge factor on a boosted capture
-    double penaltyWinrate;//lzLadderPenaltyWinrate: winrate nudge factor on a penalty
-    int ladderMaxNodes;  //lzLadderMaxNodes: node budget of the depth solver (reference 25000)
+    int minDepth;        //lzLadderMinDepth: min remaining escape depth (plies) for the value correction
     double ladderValueBlend;//lzLadderEscapedValueBlend: blend for a solver-certified escaped group
 
     Params();
@@ -97,6 +93,26 @@ namespace LzLadder {
   //two liberties whose solver verdict matters). The escaped-group value correction only runs while
   //this is set, so ordinary searches pay nothing for it.
   extern std::atomic<int> rootArmed;
+
+  //Shared certification of "a real ladder escape", used by the rescue boost, the root arming scan
+  //and the escaped-group value blend so all three apply the same predicate:
+  //  - the group is `pla`'s, has exactly one liberty, and at least `minStones` stones;
+  //  - its extension is the ONLY empty neighbor, reaches exactly two liberties and creates no ko;
+  //  - the solver, attacker to move, says it cannot be captured and the verdict is known
+  //    (depth > 0; the solver's node budget is upstream's fixed 25000, exhausted => 0);
+  //  - that escape is a long ladder, i.e. the remaining depth is at least `minDepth` plies.
+  //*outMove receives the extension, *outDepth the solver's escape depth.
+  bool isRealLadderEscape(
+    const Board& board, const BoardHistory& history, Loc loc, Player pla,
+    int minStones, int minDepth, Loc* outMove, int* outDepth
+  );
+
+  //Same certification for a group that already reached two liberties ("the escape already
+  //happened"). *outMove receives one of its liberties.
+  bool isEscapedTwoLibertyGroup(
+    const Board& board, Loc loc, Player pla, int minStones, int minDepth,
+    Loc* outMove, int* outDepth
+  );
 }
 
 // Result of NNEvaluator::benchmarkPureForward
