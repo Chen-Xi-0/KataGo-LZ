@@ -53,6 +53,7 @@ SearchParams::SearchParams()
    rootSymmetryPruning(false),
    rootDesiredPerChildVisitsCoeff(0.0),
    rootPolicyOptimism(0.0),
+   auxValueWeight(0.0),
    chosenMoveTemperature(0.0),
    chosenMoveTemperatureEarly(0.0),
    chosenMoveTemperatureHalflife(19),
@@ -186,6 +187,7 @@ bool SearchParams::operator==(const SearchParams& other) const {
     rootDesiredPerChildVisitsCoeff == other.rootDesiredPerChildVisitsCoeff &&
 
     rootPolicyOptimism == other.rootPolicyOptimism &&
+    auxValueWeight == other.auxValueWeight &&
 
     chosenMoveTemperature == other.chosenMoveTemperature &&
     chosenMoveTemperatureEarly == other.chosenMoveTemperatureEarly &&
@@ -451,6 +453,7 @@ json SearchParams::changeableParametersToJson() const {
   ret["rootDesiredPerChildVisitsCoeff"] = rootDesiredPerChildVisitsCoeff;
 
   ret["rootPolicyOptimism"] = rootPolicyOptimism;
+  ret["auxValueWeight"] = auxValueWeight;
 
   ret["chosenMoveTemperature"] = chosenMoveTemperature;
   ret["chosenMoveTemperatureEarly"] = chosenMoveTemperatureEarly;
@@ -646,6 +649,7 @@ void SearchParams::printParams(std::ostream& out) const {
   PRINTPARAM(rootDesiredPerChildVisitsCoeff);
 
   PRINTPARAM(rootPolicyOptimism);
+  PRINTPARAM(auxValueWeight);
 
   PRINTPARAM(chosenMoveTemperature);
   PRINTPARAM(chosenMoveTemperatureEarly);
