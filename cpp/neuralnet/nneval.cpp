@@ -1283,14 +1283,14 @@ static void applyLZLadderCorrectionV5(
       if(boostLogit > policy[p])
         policy[p] = boostLogit;
     };
-    //Boost is the reference's prior lift for a capture that cannot escape. The reference has no
-    //depth threshold on it, so pass minDepth=1: only a known solver verdict is required (depth 0
-    //means the solver's node budget was exhausted).
+    //Rescue boost: our one-liberty group's saving extension. Same long-ladder depth floor as the
+    //root gate and the value blend - a short escape is visible to the value head, so lifting its
+    //prior would only bias the search.
     for(int y = 0; y < board.y_size; y++) {
       for(int x = 0; x < board.x_size; x++) {
         Loc loc = Location::getLoc(x,y,board.x_size);
         Loc move = Board::NULL_LOC;
-        if(LzLadder::isRealLadderEscape(board, history, loc, nextPlayer, P.minStones, 1, &move, NULL))
+        if(LzLadder::isRealLadderEscape(board, history, loc, nextPlayer, P.minStones, P.minDepth, &move, NULL))
           boostAt(move);
       }
     }
@@ -1398,8 +1398,10 @@ static void applyLZLadderCorrectionV5(
         bool capturedLine = false;
         if(captured == 0 && postLibs <= 1 && chainSize >= P.chaseStones)
           capturedLine = copy.searchIsLadderCaptured(nb,true,buf,&d);
-        //Reference boost: our move puts an opponent group into atari that cannot escape.
-        if(captured == 0 && postLibs == 1 && capturedLine)
+        //Reference boost: our move puts an opponent group into atari that cannot escape. Only a
+        //LONG ladder capture needs the prior lift: a short capture is visible to the value head.
+        //The solver's depth is negative here (plies to the capture).
+        if(captured == 0 && postLibs == 1 && capturedLine && d <= -P.minDepth)
           doBoost = true;
         //Reference offence penalty: our atari hits a group that gets out, after a long chase.
         if(P.offenseEnabled && captured == 0 && postLibs == 1
