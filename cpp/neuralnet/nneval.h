@@ -86,6 +86,7 @@ namespace LzLadder {
     int offenseDepth;    //lzLadderOffenseDepth: chase length that counts as futile
     double boostWinrate; //lzLadderBoostWinrate: winrate nudge factor on a boosted capture
     double penaltyWinrate;//lzLadderPenaltyWinrate: winrate nudge factor on a penalty
+    int ladderMaxNodes;  //lzLadderMaxNodes: node budget of the depth solver (reference 25000)
 
     Params();
   };

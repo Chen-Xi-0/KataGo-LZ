@@ -1130,8 +1130,8 @@ namespace LzLadder {
   Params::Params()
     : enabled(true), minStones(1), valueBlend(0.8), maxPlies(40),
       checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
-      boostFactor(1.5), defenseDepth(4), offenseEnabled(true), offenseDepth(8),
-      boostWinrate(0.0), penaltyWinrate(0.9) {}
+      boostFactor(2.0), defenseDepth(11), offenseEnabled(true), offenseDepth(8),
+      boostWinrate(0.3), penaltyWinrate(0.9), ladderMaxNodes(4000) {}
 }
 
 //The value override lives one level up (evaluateWithLzLadder): calling evaluate() from inside
@@ -1406,6 +1406,71 @@ static void applyLZLadderCorrectionV5(
   //           the losing line is deep enough and materially bad enough to be worth pricing.
   //  chase  : "do not chase a group that escapes" stays DISABLED by default - we have no
   //           chase-depth measure, and without it the rule over-triggers and removes good ataris.
+  //---------------------------------------------------------------------------
+  //Group-driven rescue boost. The candidate-driven pass below only examines the top
+  //`checkNodes` priors, so a correct escape move whose prior sits 30 ranks down is never
+  //looked at (measured: the escape in the yin-zheng position has a 0.37% prior). Walk the
+  //board's own one-liberty groups instead and promote the single move that saves them:
+  //our group is in atari, the extension is solver-certified as un-capturable, and the group
+  //reaches exactly two liberties (a real ladder escape). The "three or more liberties" case is
+  //deliberately excluded - it fires on every dead stone that merely merges into a bigger
+  //friendly group.
+  if((float)P.boostFactor > 1.0f) {
+    const auto boostAt = [&](Loc loc) {
+      const int p = NNPos::locToPos(loc, board.x_size, nnXLen, nnYLen);
+      if(p < 0 || p >= policySize || !isLegal[p])
+        return;
+      const float boostLogit = maxLogit + std::log((float)P.boostFactor);
+      if(boostLogit > policy[p])
+        policy[p] = boostLogit;
+    };
+    for(int y = 0; y < board.y_size; y++) {
+      for(int x = 0; x < board.x_size; x++) {
+        Loc loc = Location::getLoc(x,y,board.x_size);
+        if(board.colors[loc] != nextPlayer)
+          continue;
+        if(board.chain_head[loc] != loc)
+          continue;
+        if(board.getNumLiberties(loc) != 1)
+          continue;
+        if(board.getChainSize(loc) < P.minStones)
+          continue;
+        Loc lib = Board::NULL_LOC;
+        int numEmpty = 0;
+        {
+          Loc head = board.chain_head[loc];
+          for(int yy = 0; yy < board.y_size; yy++) {
+            for(int xx = 0; xx < board.x_size; xx++) {
+              if(board.chain_head[Location::getLoc(xx,yy,board.x_size)] != head)
+                continue;
+              for(int d = 0; d < 4; d++) {
+                const int nx = xx + (d==0?1:d==1?-1:0);
+                const int ny = yy + (d==2?1:d==3?-1:0);
+                if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
+                  continue;
+                Loc nb = Location::getLoc(nx,ny,board.x_size);
+                if(board.colors[nb] == C_EMPTY) { lib = nb; numEmpty++; }
+              }
+            }
+          }
+        }
+        if(numEmpty != 1 || lib == Board::NULL_LOC)
+          continue;
+        Board trial(board);
+        BoardHistory trialHist(history);
+        if(!trialHist.makeBoardMoveTolerant(trial,lib,nextPlayer))
+          continue;
+        if(trial.ko_loc != Board::NULL_LOC)
+          continue;
+        if(trial.getNumLiberties(lib) != 2)
+          continue;
+        int d = 0;
+        if(!trial.searchIsLadderCaptured(lib,false,buf,&d))
+          boostAt(lib);
+      }
+    }
+  }
+
   vector<pair<float,int>> candidates;
   candidates.reserve(policySize);
   for(int pos = 0; pos<policySize; pos++) {
@@ -1495,50 +1560,39 @@ static void applyLZLadderCorrectionV5(
         continue;
 
       if(col != nextPlayer) {
-        //Winning ladder capture: opponent group in atari that cannot escape even defending,
-        //OR a two-liberty group that the solver already certifies we run down from here. The
-        //two-liberty form matters for the ladder-breaker ("yin-zheng") shapes, where the
-        //strongest move is not an immediate atari but the move that starts the winning chase.
-        if(captured == 0 && postLibs == 1) {
-          if(copy.searchIsLadderCaptured(nb,true,buf))
-            doBoost = true;
-        }
-        //(No two-liberty boost: the reference only promotes moves that put a group into atari.
-        //Extending it to 2-liberty groups promoted almost every move that starts a chase - in the
-        //yin-zheng position it lifted a 0.8%-prior move to 30% and drowned the real escape move.)
-        //Futile chase: our atari hits a group that gets out, and the chase runs long enough that
-        //it is pure waste (the fork's IsLadderChase depth gate). Zero it - a soft demotion does
-        //not change the move choice at low visit counts.
+        const int chainSize = copy.getChainSize(nb);
+        //"Complete the ladder" from the defender's turn: he extends at his only liberty, then the
+        //chase is played out. Gives BOTH numbers at once - captured (and how many plies to the
+        //capture) or escaped (and how many plies the defender ran).
+        //The solver itself now reports the depth of its verdict (reference LadderDetection's
+        //max_depth / dead_depth): d < 0 = captured in -d plies, d > 0 = escaped, d = 0 unknown.
+        int d = 0;
+        bool capturedLine = false;
+        if(captured == 0 && postLibs <= 1 && chainSize >= P.chaseStones)
+          capturedLine = copy.searchIsLadderCaptured(nb,true,buf,&d);
+        //Reference boost: our move puts an opponent group into atari that cannot escape.
+        if(captured == 0 && postLibs == 1 && capturedLine)
+          doBoost = true;
+        //Reference offence penalty: our atari hits a group that gets out, after a long chase.
         if(P.offenseEnabled && captured == 0 && postLibs == 1
-           && copy.getChainSize(nb) >= P.chaseStones
-           && !copy.searchIsLadderCaptured(nb,true,buf)) {
-          int chasePlies = 0;
-          measureChaseFromDefenderTurn(copy,copyHist,nextPlayer,nb,P.maxPlies,&chasePlies);
-          if(chasePlies >= P.offenseDepth)
-            doDemote = true;
-        }
+           && chainSize >= P.chaseStones && !capturedLine && d >= P.offenseDepth)
+          doDemote = true;
       }
       else {
-        //Our move leaves an own two-liberty group that the opponent can ladder-capture.
+        //Reference defence rule: our move leaves an own two-liberty group that the opponent
+        //captures (depth solver, defender to move first), the losing line is deep enough, and it
+        //costs more stones than the captures we just made.
         const int chainSize = copy.getChainSize(nb);
         if(postLibs == 2 && chainSize > captured && chainSize >= P.minStones) {
-          vector<Loc> wm;
-          if(!copy.searchIsLadderCapturedAttackerFirst2Libs(nb,buf,wm)) {
-            //The same extension taken from atari reaches two liberties that the solver says the
-            //opponent cannot run down: the ladder escape works, promote it.
-            if(preLibs == 1)
-              doBoost = true;
-          }
-          else {
-            Board endBoard;
-            BoardHistory endHist(copyHist);
-            int plies = 0;
-            if(expandLadderLine(copy,copyHist,getOpp(nextPlayer),nb,P.maxPlies,endBoard,endHist,&plies)) {
-              //Reference gates: the line must be deep enough, and losing it must cost more
-              //stones than the captures we just made.
-              if(plies >= P.defenseDepth && (plies/2 + chainSize) > captured)
-                doDemote = true;
-            }
+          //Our group is at two liberties and it is the attacker's turn: the solver's
+          //attacker-first form is the right gate, then "complete the ladder" gives the ply count
+          //to the capture (that is the same number the reference's IsLadderEscape reports negated).
+          //Attacker to move on our two-liberty group: same solver, depth included.
+          int d = 0;
+          if(copy.searchIsLadderCaptured(nb,false,buf,&d)) {
+            const int plies = -d;
+            if(plies >= P.defenseDepth && (plies/2 + chainSize) > captured)
+              doDemote = true;
           }
         }
       }
