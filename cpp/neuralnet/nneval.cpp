@@ -1130,7 +1130,7 @@ namespace LzLadder {
   Params::Params()
     : enabled(true), minStones(1), valueBlend(0.8), maxPlies(40),
       checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
-      boostFactor(1.5) {}
+      boostFactor(1.5), defenseDepth(4), offenseEnabled(true), offenseDepth(8) {}
 }
 
 //The value override lives one level up (evaluateWithLzLadder): calling evaluate() from inside
@@ -1147,7 +1147,7 @@ namespace LzLadder {
 //only the precise end board may differ from the defender's best counter-play.
 static bool expandLadderLine(
   const Board& startBoard, const BoardHistory& startHist, Player attacker, Loc groupLoc,
-  int maxPlies, Board& endBoard, BoardHistory& endHist
+  int maxPlies, Board& endBoard, BoardHistory& endHist, int* outPlies = NULL
 ) {
   const Player defender = getOpp(attacker);
   vector<Loc> buf;
@@ -1196,6 +1196,7 @@ static bool expandLadderLine(
               endHist = h2;
               traceMove("ATK-CAP", attacker, nb, t2);
               if(trace) std::fprintf(stderr, "[LADT] END captured\n");
+              if(outPlies != NULL) *outPlies = plies + 1;
               return true;
             }
           }
@@ -1203,10 +1204,15 @@ static bool expandLadderLine(
       }
       if(getenv("LZ_LADDER_DEBUG") != NULL && plies < 6)
         std::fprintf(stderr, "[LADX] ply=%d no-capture-move-worked\n", plies);
+      if(outPlies != NULL) *outPlies = plies + 1;
       return false;
     }
-    if(curLibs != 2)
-      return false; //escaped shape: line no longer canonical
+    if(curLibs != 2) {
+      //escaped shape: line no longer canonical. Report how far it got - the caller uses this as
+      //the chase length ("how far does the defender run before the chase breaks").
+      if(outPlies != NULL) *outPlies = plies + 1;
+      return false;
+    }
 
     //Attacker: pick a working move whose atari keeps the group captured-even-defending.
     if(!endBoard.searchIsLadderCapturedAttackerFirst2Libs(groupLoc, buf, workingMoves)) {
@@ -1305,6 +1311,7 @@ static bool expandLadderLine(
       return false;
     }
   }
+  if(outPlies != NULL) *outPlies = maxPlies;
   return false;
 }
 
@@ -1316,6 +1323,52 @@ static bool expandLadderLine(
 //in KataGo's board coordinates via NNPos::posToLoc / locToPos, which are top-origin. The
 //pos<->loc mapping is therefore self-consistent here (both directions go through the same
 //helpers), and no extra flip is needed.
+//Measures the ladder chase for an opponent group (defender to move): the defender extends at its
+//only liberty, then the attacker chases with expandLadderLine. Returns true when the attacker
+//captures, false when the defender gets out; *outPlies is the number of plies played either way
+//(for the escape case it is "how far the defender runs before the chase breaks").
+static bool measureChaseFromDefenderTurn(
+  const Board& board, const BoardHistory& history, Player attacker, Loc groupLoc,
+  int maxPlies, int* outPlies
+) {
+  if(outPlies != NULL) *outPlies = 0;
+  if(board.getNumLiberties(groupLoc) != 1)
+    return board.getNumLiberties(groupLoc) == 0;
+  const Player defender = getOpp(attacker);
+  Loc lib = Board::NULL_LOC;
+  {
+    const int xSize = board.x_size;
+    Loc head = board.chain_head[groupLoc];
+    for(int y = 0; y < board.y_size && lib == Board::NULL_LOC; y++) {
+      for(int x = 0; x < xSize; x++) {
+        if(board.chain_head[Location::getLoc(x,y,xSize)] != head)
+          continue;
+        for(int d = 0; d<4; d++) {
+          const int nx = x + (d==0?1:d==1?-1:0);
+          const int ny = y + (d==2?1:d==3?-1:0);
+          if(nx < 0 || nx >= xSize || ny < 0 || ny >= board.y_size)
+            continue;
+          Loc nb = Location::getLoc(nx,ny,xSize);
+          if(board.colors[nb] == C_EMPTY) { lib = nb; break; }
+        }
+        if(lib != Board::NULL_LOC) break;
+      }
+    }
+  }
+  if(lib == Board::NULL_LOC)
+    return true;
+  Board trial(board);
+  BoardHistory trialHist(history);
+  if(!trialHist.makeBoardMoveTolerant(trial,lib,defender))
+    return true;
+  Board endBoard;
+  BoardHistory endHist(trialHist);
+  int plies = 0;
+  const bool capturedLine = expandLadderLine(trial,trialHist,attacker,lib,maxPlies,endBoard,endHist,&plies);
+  if(outPlies != NULL) *outPlies = plies + 1;
+  return capturedLine;
+}
+
 static void applyLZLadderCorrectionV5(
   const Board& board,
   const BoardHistory& history,
@@ -1342,13 +1395,15 @@ static void applyLZLadderCorrectionV5(
   static const int NDX[4] = {1,-1,0,0};
   static const int NDY[4] = {0,0,1,-1};
   vector<Loc> buf;
+  vector<Loc> workingMoves;
 
-  //Policy surgery on the top candidates, mirroring the reference fork's LadderDetection:
-  //mild rank demotion for moves that leave a solver-dead own group, zeroing for futile chases
-  //of solver-alive groups. The reference implementation also BOOSTS escapes that work and
-  //scales its winrate change by the move's own prior (LK/lzl-src/src/LadderDetection.cpp);
-  //neither is ported here yet, so the magnitude still comes from the value override in
-  //evaluateWithLzLadder. Do not describe this as "same as the reference" until those land.
+  //Reference-fork (LK/lzl-src LadderDetection) semantics, ported:
+  //  boost  : our move puts an OPPONENT group into atari (1 liberty, nothing captured) and that
+  //           group cannot run the ladder -> winning ladder capture, lift this move's prior.
+  //  demote : our move leaves an OWN two-liberty group that the opponent can ladder-capture and
+  //           the losing line is deep enough and materially bad enough to be worth pricing.
+  //  chase  : "do not chase a group that escapes" stays DISABLED by default - we have no
+  //           chase-depth measure, and without it the rule over-triggers and removes good ataris.
   vector<pair<float,int>> candidates;
   candidates.reserve(policySize);
   for(int pos = 0; pos<policySize; pos++) {
@@ -1367,11 +1422,6 @@ static void applyLZLadderCorrectionV5(
     [](const pair<float,int>& a, const pair<float,int>& b) { return a.first > b.first; }
   );
 
-  //Demotion target: drop just below the penaltyRank-th ranked move (probability factor
-  //applied in log space, which the subsequent softmax preserves exactly).
-  float refLogit = candidates[std::min((size_t)P.penaltyRank, candidates.size()-1)].first;
-  const float demoteLogit = refLogit + std::log((float)P.policyFactor);
-
   for(int i = 0; i<numCandidates; i++) {
     const float logit = candidates[i].first;
     if(logit < maxLogit + std::log((float)P.minPolicy))
@@ -1384,7 +1434,7 @@ static void applyLZLadderCorrectionV5(
     const int x = Location::getX(moveLoc,board.x_size);
     const int y = Location::getY(moveLoc,board.x_size);
     //Cheap precheck: only moves that touch a group with at most two liberties can change a
-    //ladder verdict, so skip the copy and search for everything else.
+    //ladder verdict, so skip the copy and the solver for everything else.
     bool nearAtari = false;
     for(int d = 0; d<4; d++) {
       const int nx = x + NDX[d];
@@ -1392,14 +1442,19 @@ static void applyLZLadderCorrectionV5(
       if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
         continue;
       Loc nb = Location::getLoc(nx,ny,board.x_size);
-      if(board.colors[nb] != C_EMPTY && board.getNumLiberties(nb) <= 2)
+      //<=3, not <=2: our move can drop the group by one liberty (or more if it also captures),
+      //so a group that ends up in atari may well have had three liberties before the move.
+      if(board.colors[nb] != C_EMPTY && board.getNumLiberties(nb) <= 3) {
         nearAtari = true;
+        break;
+      }
     }
     if(!nearAtari)
       continue;
 
     Board copy(board);
-    if(!copy.playMove(moveLoc,nextPlayer,suicideLegal))
+    BoardHistory copyHist(history);
+    if(!copyHist.makeBoardMoveTolerant(copy,moveLoc,nextPlayer))
       continue;
     //Kos make the ladder verdict unreliable (the recapture might be illegal), so skip them.
     if(copy.ko_loc != Board::NULL_LOC)
@@ -1409,12 +1464,10 @@ static void applyLZLadderCorrectionV5(
       ? (int)(copy.numWhiteCaptures - board.numWhiteCaptures)
       : (int)(copy.numBlackCaptures - board.numBlackCaptures);
 
-    bool defenseFail = false;
-    bool chaseFail = false;
-    bool defenseOk = false;
-
     Loc checkedHeads[4];
     int numChecked = 0;
+    bool doBoost = false;
+    bool doDemote = false;
     for(int d = 0; d<4; d++) {
       const int nx = x + NDX[d];
       const int ny = y + NDY[d];
@@ -1435,41 +1488,70 @@ static void applyLZLadderCorrectionV5(
         checkedHeads[numChecked++] = head;
 
       const int postLibs = copy.getNumLiberties(nb);
+      const int preLibs = board.getNumLiberties(nb);
       if(postLibs > 2)
         continue;
-      if(col == nextPlayer) {
-        //Our move leaves an own two-liberty group that the opponent, moving next, can
-        //ladder-capture (the fork's IsLadderEscape verdict, boolean form). The fork also
-        //requires stone_count > capture_count so capturing connections are not demoted.
-        if(postLibs == 2 && copy.getChainSize(nb) > captured) {
-          vector<Loc> wm;
-          if(copy.searchIsLadderCapturedAttackerFirst2Libs(nb,buf,wm))
-            defenseFail = true;
-          else
-            defenseOk = true;
+
+      if(col != nextPlayer) {
+        //Winning ladder capture: opponent group in atari that cannot escape even defending,
+        //OR a two-liberty group that the solver already certifies we run down from here. The
+        //two-liberty form matters for the ladder-breaker ("yin-zheng") shapes, where the
+        //strongest move is not an immediate atari but the move that starts the winning chase.
+        if(captured == 0 && postLibs == 1) {
+          if(copy.searchIsLadderCaptured(nb,true,buf))
+            doBoost = true;
+        }
+        //(No two-liberty boost: the reference only promotes moves that put a group into atari.
+        //Extending it to 2-liberty groups promoted almost every move that starts a chase - in the
+        //yin-zheng position it lifted a 0.8%-prior move to 30% and drowned the real escape move.)
+        //Futile chase: our atari hits a group that gets out, and the chase runs long enough that
+        //it is pure waste (the fork's IsLadderChase depth gate). Zero it - a soft demotion does
+        //not change the move choice at low visit counts.
+        if(P.offenseEnabled && captured == 0 && postLibs == 1
+           && copy.getChainSize(nb) >= P.chaseStones
+           && !copy.searchIsLadderCaptured(nb,true,buf)) {
+          int chasePlies = 0;
+          measureChaseFromDefenderTurn(copy,copyHist,nextPlayer,nb,P.maxPlies,&chasePlies);
+          if(chasePlies >= P.offenseDepth)
+            doDemote = true;
         }
       }
       else {
-        //Our move ataris (captures nothing) a big opponent group that escapes even with the
-        //defender moving first: a futile chase (the fork's IsLadderChase verdict).
-        if(captured == 0 && postLibs == 1 && copy.getChainSize(nb) >= P.chaseStones) {
-          if(!copy.searchIsLadderCaptured(nb,true,buf))
-            chaseFail = true;
+        //Our move leaves an own two-liberty group that the opponent can ladder-capture.
+        const int chainSize = copy.getChainSize(nb);
+        if(postLibs == 2 && chainSize > captured && chainSize >= P.minStones) {
+          vector<Loc> wm;
+          if(!copy.searchIsLadderCapturedAttackerFirst2Libs(nb,buf,wm)) {
+            //The same extension taken from atari reaches two liberties that the solver says the
+            //opponent cannot run down: the ladder escape works, promote it.
+            if(preLibs == 1)
+              doBoost = true;
+          }
+          else {
+            Board endBoard;
+            BoardHistory endHist(copyHist);
+            int plies = 0;
+            if(expandLadderLine(copy,copyHist,getOpp(nextPlayer),nb,P.maxPlies,endBoard,endHist,&plies)) {
+              //Reference gates: the line must be deep enough, and losing it must cost more
+              //stones than the captures we just made.
+              if(plies >= P.defenseDepth && (plies/2 + chainSize) > captured)
+                doDemote = true;
+            }
+          }
         }
       }
     }
 
-    if(defenseFail)
-      policy[pos] = demoteLogit;
-    else if(chaseFail)
-      policy[pos] = -1e30f;
-    else if(defenseOk && (float)P.boostFactor > 1.0f) {
-      //Reference fork's boost: a move that leaves our own two-liberty group ALIVE (the solver
-      //says the opponent cannot run the chase down) is the escape that actually works, so lift
-      //it above the current top candidate instead of only penalising failed ones.
+    if(doBoost && (float)P.boostFactor > 1.0f) {
       const float boostLogit = maxLogit + std::log((float)P.boostFactor);
       if(boostLogit > policy[pos])
         policy[pos] = boostLogit;
+    }
+    else if(doDemote) {
+      //Same as the previous chase rule: zero the prior outright. A soft demotion does not change
+      //the move choice at low visit counts, and the gates above (solver verdict + depth +
+      //material) keep this from firing on ordinary ataris.
+      policy[pos] = -1e30f;
     }
   }
 }
@@ -1949,94 +2031,9 @@ void NNEvaluator::evaluateWithLzLadder(
   bool skipCache,
   bool includeOwnerMap
 ) {
+  //Reference-fork fidelity: the whole ladder correction is a POLICY surgery on the network output
+  //(applyLZLadderCorrectionV5). No tree-value override, hence no extra network call per node.
   evaluate(board, history, nextPlayer, sgfMeta, nnInputParams, buf, skipCache, includeOwnerMap);
-
-  if(getenv("LZ_LADDER_DEBUG") != NULL) {
-    static std::atomic<int> dbgEntry(0);
-    if(dbgEntry.load() < 10) {
-      dbgEntry.fetch_add(1);
-      std::fprintf(stderr, "[LADE] wrapper isLZ=%d enabled=%d noLadEnv=%d ko=%d\n",
-        (int)isLZModelFlag, (int)LzLadder::params.enabled,
-        (int)(getenv("LZ_NO_LADDER") != NULL), (int)board.ko_loc);
-    }
-  }
-
-  if(!isLZModelFlag || !LzLadder::params.enabled || getenv("LZ_NO_LADDER") != NULL)
-    return;
-  if(buf.result == NULL)
-    return;
-  //Kos make ladder verdicts unreliable (the recapture might be illegal), so skip them.
-  if(board.ko_loc != Board::NULL_LOC)
-    return;
-
-  const LzLadder::Params& P = LzLadder::params;
-  float endWhiteWin = -1.0f;
-  NNInputs::iterateLadderGroups(board, [&](Loc loc, int libs, bool captured, const vector<Loc>&) {
-    if(getenv("LZ_LADDER_DEBUG") != NULL) {
-      static std::atomic<int> dbgCount(0);
-      if(dbgCount.load() < 30) {
-        dbgCount.fetch_add(1);
-        std::fprintf(stderr, "[LADG] loc=(%d,%d) libs=%d captured=%d size=%d color=%d nextPla=%d\n",
-          Location::getX(loc,board.x_size), Location::getY(loc,board.x_size),
-          libs, (int)captured, board.getChainSize(loc), (int)board.colors[loc], (int)nextPlayer);
-      }
-    }
-    if(endWhiteWin >= 0.0f)
-      return; //first resolved ladder wins
-    //Two-liberty groups: only when the solver certifies the chase wins (attacker first).
-    //One-liberty groups - an atari already hanging on the board, e.g. after the defender
-    //tenuki'd to a ladder breaker: the attacker can capture on demand whenever it is the
-    //attacker's turn, so no solver verdict is needed; the expander's first move resolves
-    //it on the board (self-verifying). The defender-to-move case needs no override: its
-    //extension lands on the two-liberty path above.
-    if(libs == 2) {
-      if(!captured)
-        return;
-    }
-    else if(libs != 1)
-      return;
-    Color stone = board.colors[loc];
-    if(stone == C_EMPTY)
-      return;
-
-    //Reference-fork parity: the value override only speaks about solver-certified captures of
-    //two-liberty groups (the defender has already run and the chase still wins). One-liberty
-    //groups - which may well be laddered single stones - are handled by the policy surgery
-    //above; overriding their VALUE used to force the node onto "what the board looks like after
-    //we fill that liberty", which let an unrelated throw-in hijack the node (first resolved
-    //group wins) and starved the real ladder group elsewhere on the board.
-    if(libs != 2 || !captured)
-      return;
-    if(board.getChainSize(loc) < P.minStones)
-      return;
-    Board endBoard;
-    BoardHistory endHist(history);
-    if(!expandLadderLine(board, history, nextPlayer, loc, P.maxPlies, endBoard, endHist))
-      return;
-    //Deterministic symmetry; cache enabled - the search will often want this exact resolved
-    //position next, so the extra eval is not wasted.
-    MiscNNInputParams endParams = nnInputParams;
-    endParams.symmetry = 0;
-    NNResultBuf endBuf;
-    try {
-      evaluate(endBoard, endHist, endHist.presumedNextMovePla, sgfMeta, endParams, endBuf, false, false);
-      endWhiteWin = endBuf.result->whiteWinProb;
-    }
-    catch(const std::exception&) {
-      //Never let the correction break an eval; the value simply stays uncorrected.
-    }
-  });
-
-  if(endWhiteWin >= 0.0f) {
-    float blend = (float)P.valueBlend;
-    float blended = (1.0f - blend) * buf.result->whiteWinProb + blend * endWhiteWin;
-    if(getenv("LZ_LADDER_DEBUG") != NULL)
-      std::fprintf(stderr, "[LADV] override raw=%.4f end=%.4f -> %.4f\n",
-        buf.result->whiteWinProb, endWhiteWin, blended);
-    buf.result->whiteWinProb = blended;
-    //LZ nets report no noResult, so the win/loss pair stays a valid distribution.
-    buf.result->whiteLossProb = 1.0f - blended - buf.result->whiteNoResultProb;
-  }
 }
 
 // Uncomment this to lower the effective hash size down to one where we get true collisions
