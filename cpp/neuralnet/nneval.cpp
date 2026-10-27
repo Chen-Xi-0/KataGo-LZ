@@ -1483,6 +1483,9 @@ static void applyLZLadderCorrectionV5(
   if(candidates.empty())
     return;
 
+  float refLogit = candidates[std::min((size_t)P.penaltyRank, candidates.size()-1)].first;
+  const float demoteLogit = refLogit + std::log((float)P.policyFactor);
+
   int numCandidates = std::min((int)candidates.size(), P.checkNodes);
   std::partial_sort(
     candidates.begin(), candidates.begin() + numCandidates, candidates.end(),
@@ -1619,10 +1622,15 @@ static void applyLZLadderCorrectionV5(
       }
     }
     else if(doDemote) {
-      //Same as the previous chase rule: zero the prior outright. A soft demotion does not change
-      //the move choice at low visit counts, and the gates above (solver verdict + depth +
-      //material) keep this from firing on ordinary ataris.
-      policy[pos] = -1e30f;
+      //Reference penalty semantics: cfg_ladder_penalty_base > 0 demotes the move to just below
+      //the penaltyRank-th candidate times policyFactor; only penalty_base == 0 zeroes it outright.
+      if(P.penaltyRank > 0) {
+        if(demoteLogit < policy[pos])
+          policy[pos] = demoteLogit;
+      }
+      else {
+        policy[pos] = -1e30f;
+      }
     }
   }
 }
