@@ -334,8 +334,8 @@ public class CoreMLComputeHandle {
     }
 }
 
-/// Delete the source .mlpackage after compilation
-/// CoreML caches the compiled model, so the source is no longer needed
+/// Remove a temp bundle this function created and is not handing to MLModel.
+/// A cleanup failure is logged, not thrown: it must not mask the error that caused it.
 private func deleteSourceModel(at url: URL, serverThreadIdx: Int) {
     do {
         try FileManager.default.removeItem(at: url)
@@ -375,8 +375,29 @@ public func createCoreMLComputeHandle(
         printError("Metal backend \(serverThreadIdx): Compiling model...")
         let compiledURL = try MLModel.compileModel(at: mlpackagePath)
 
+        // compileModel(at:) writes the .mlmodelc into NSTemporaryDirectory(), which
+        // ignores TMPDIR. Move it next to the .mlpackage the C++ side passed in
+        // (temp_directory_path(), which honors TMPDIR) before loading, so the bundle
+        // shares that directory's lifetime. Derive the destination from that path
+        // rather than resolving the temp directory again here.
+        // MLModel may read the bundle lazily, so a successful load retains it.
+        // Only a bundle that never gets handed back is removed.
+        let stagedURL = mlpackagePath.deletingLastPathComponent()
+            .appendingPathComponent(compiledURL.lastPathComponent)
+        var unusedCompiledURL: URL? = compiledURL
+        defer {
+            if let unusedCompiledURL {
+                deleteSourceModel(at: unusedCompiledURL, serverThreadIdx: serverThreadIdx)
+            }
+        }
+        if stagedURL.standardizedFileURL != compiledURL.standardizedFileURL {
+            try FileManager.default.moveItem(at: compiledURL, to: stagedURL)
+            unusedCompiledURL = stagedURL
+        }
+
         printError("Metal backend \(serverThreadIdx): Loading compiled model...")
-        let model = try MLModel(contentsOf: compiledURL, configuration: config)
+        let model = try MLModel(contentsOf: stagedURL, configuration: config)
+        unusedCompiledURL = nil
 
         printError("Metal backend \(serverThreadIdx): Model loaded successfully, \(context.nnXLen)x\(context.nnYLen)")
 
