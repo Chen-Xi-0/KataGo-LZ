@@ -380,24 +380,21 @@ public func createCoreMLComputeHandle(
         // (temp_directory_path(), which honors TMPDIR) before loading, so the bundle
         // shares that directory's lifetime. Derive the destination from that path
         // rather than resolving the temp directory again here.
-        // MLModel may read the bundle lazily, so a successful load retains it.
-        // Only a bundle that never gets handed back is removed.
+        // A failed move is not fatal: load from where compileModel left the bundle.
+        // Do not delete the compiled bundle on either path.
         let stagedURL = mlpackagePath.deletingLastPathComponent()
             .appendingPathComponent(compiledURL.lastPathComponent)
-        var unusedCompiledURL: URL? = compiledURL
-        defer {
-            if let unusedCompiledURL {
-                deleteSourceModel(at: unusedCompiledURL, serverThreadIdx: serverThreadIdx)
-            }
-        }
-        if stagedURL.standardizedFileURL != compiledURL.standardizedFileURL {
+        let modelURL: URL
+        do {
             try FileManager.default.moveItem(at: compiledURL, to: stagedURL)
-            unusedCompiledURL = stagedURL
+            modelURL = stagedURL
+        } catch {
+            printError("Metal backend \(serverThreadIdx): Warning: Failed to move compiled model to \(stagedURL.path), loading it from \(compiledURL.path): \(error)")
+            modelURL = compiledURL
         }
 
         printError("Metal backend \(serverThreadIdx): Loading compiled model...")
-        let model = try MLModel(contentsOf: stagedURL, configuration: config)
-        unusedCompiledURL = nil
+        let model = try MLModel(contentsOf: modelURL, configuration: config)
 
         printError("Metal backend \(serverThreadIdx): Model loaded successfully, \(context.nnXLen)x\(context.nnYLen)")
 
