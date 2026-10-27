@@ -334,8 +334,8 @@ public class CoreMLComputeHandle {
     }
 }
 
-/// Delete the source .mlpackage after compilation
-/// CoreML caches the compiled model, so the source is no longer needed
+/// Remove a temp bundle this function created and is not handing to MLModel.
+/// A cleanup failure is logged, not thrown: it must not mask the error that caused it.
 private func deleteSourceModel(at url: URL, serverThreadIdx: Int) {
     do {
         try FileManager.default.removeItem(at: url)
@@ -375,8 +375,26 @@ public func createCoreMLComputeHandle(
         printError("Metal backend \(serverThreadIdx): Compiling model...")
         let compiledURL = try MLModel.compileModel(at: mlpackagePath)
 
+        // compileModel(at:) writes the .mlmodelc into NSTemporaryDirectory(), which
+        // ignores TMPDIR. Move it next to the .mlpackage the C++ side passed in
+        // (temp_directory_path(), which honors TMPDIR) before loading, so the bundle
+        // shares that directory's lifetime. Derive the destination from that path
+        // rather than resolving the temp directory again here.
+        // A failed move is not fatal: load from where compileModel left the bundle.
+        // Do not delete the compiled bundle on either path.
+        let stagedURL = mlpackagePath.deletingLastPathComponent()
+            .appendingPathComponent(compiledURL.lastPathComponent)
+        let modelURL: URL
+        do {
+            try FileManager.default.moveItem(at: compiledURL, to: stagedURL)
+            modelURL = stagedURL
+        } catch {
+            printError("Metal backend \(serverThreadIdx): Warning: Failed to move compiled model to \(stagedURL.path), loading it from \(compiledURL.path): \(error)")
+            modelURL = compiledURL
+        }
+
         printError("Metal backend \(serverThreadIdx): Loading compiled model...")
-        let model = try MLModel(contentsOf: compiledURL, configuration: config)
+        let model = try MLModel(contentsOf: modelURL, configuration: config)
 
         printError("Metal backend \(serverThreadIdx): Model loaded successfully, \(context.nnXLen)x\(context.nnYLen)")
 
