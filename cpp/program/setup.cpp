@@ -45,8 +45,6 @@ static void loadLzLadderParams(ConfigParser& cfg) {
   LzLadder::Params& p = LzLadder::params;
   if(cfg.contains("lzLadderEnabled")) p.enabled = cfg.getBool("lzLadderEnabled");
   if(cfg.contains("lzLadderMinStones")) p.minStones = cfg.getInt("lzLadderMinStones",1,361);
-  if(cfg.contains("lzLadderValueBlend")) p.valueBlend = cfg.getDouble("lzLadderValueBlend",0.0,1.0);
-  if(cfg.contains("lzLadderMaxPlies")) p.maxPlies = cfg.getInt("lzLadderMaxPlies",2,400);
   if(cfg.contains("lzLadderCheckNodes")) p.checkNodes = cfg.getInt("lzLadderCheckNodes",1,362);
   if(cfg.contains("lzLadderMinPolicy")) p.minPolicy = cfg.getDouble("lzLadderMinPolicy",1e-9,1.0);
   if(cfg.contains("lzLadderPolicyFactor")) p.policyFactor = cfg.getDouble("lzLadderPolicyFactor",1e-6,1.0);
@@ -57,8 +55,7 @@ static void loadLzLadderParams(ConfigParser& cfg) {
   if(cfg.contains("lzLadderOffenseEnabled")) p.offenseEnabled = cfg.getBool("lzLadderOffenseEnabled");
   if(cfg.contains("lzLadderOffenseDepth")) p.offenseDepth = cfg.getInt("lzLadderOffenseDepth",1,400);
   if(cfg.contains("lzLadderBoostWinrate")) p.boostWinrate = cfg.getDouble("lzLadderBoostWinrate",0.0,10.0);
-  if(cfg.contains("lzLadderPenaltyWinrate")) p.penaltyWinrate = cfg.getDouble("lzLadderPenaltyWinrate",0.0,10.0);
-  if(cfg.contains("lzLadderMaxNodes")) p.ladderMaxNodes = cfg.getInt("lzLadderMaxNodes",100,1000000);
+  if(cfg.contains("lzLadderMinDepth")) p.minDepth = cfg.getInt("lzLadderMinDepth",1,400);
   if(cfg.contains("lzLadderEscapedValueBlend")) p.ladderValueBlend = cfg.getDouble("lzLadderEscapedValueBlend",0.0,1.0);
 }
 

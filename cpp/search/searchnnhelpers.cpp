@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 
 //------------------------
@@ -40,55 +42,27 @@ void Search::computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwner
   );
 
   //Arm or disarm the LZ escaped-group value correction for this search: it may only run when the
-  //ROOT position actually contains a ladder-relevant shape. Cheap scan (one solver call per
-  //one/two-liberty chain at most), done once per root evaluation instead of per node.
+  //ROOT position contains a long ladder the side to move can really escape. Same predicate as the
+  //rescue boost (own one-liberty group, only liberty extends to exactly two liberties, no ko,
+  //solver says the attacker cannot run it down) plus the long-ladder depth floor, so short
+  //escapes the net already sees do not arm it. One solver call per one-liberty chain at most,
+  //done once per root evaluation instead of per node.
   {
     int armed = 0;
     if(LzLadder::params.enabled && board.ko_loc == Board::NULL_LOC) {
       for(int y = 0; y < board.y_size && armed == 0; y++) {
         for(int x = 0; x < board.x_size; x++) {
           Loc loc = Location::getLoc(x,y,board.x_size);
-          if(board.colors[loc] == C_EMPTY)
-            continue;
-          if(board.chain_head[loc] != loc)
-            continue;
-          if(board.getNumLiberties(loc) != 1)
-            continue;
-          //Find the group's only liberty - the escape point.
-          Loc lib = Board::NULL_LOC;
-          {
-            Loc head = board.chain_head[loc];
-            for(int yy = 0; yy < board.y_size && lib == Board::NULL_LOC; yy++) {
-              for(int xx = 0; xx < board.x_size; xx++) {
-                if(board.chain_head[Location::getLoc(xx,yy,board.x_size)] != head)
-                  continue;
-                for(int d = 0; d < 4; d++) {
-                  const int nx = xx + (d==0?1:d==1?-1:0);
-                  const int ny = yy + (d==2?1:d==3?-1:0);
-                  if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
-                    continue;
-                  Loc nb = Location::getLoc(nx,ny,board.x_size);
-                  if(board.colors[nb] == C_EMPTY) { lib = nb; break; }
-                }
-                if(lib != Board::NULL_LOC) break;
-              }
-            }
-          }
-          if(lib == Board::NULL_LOC)
-            continue;
-          Board trial(board);
-          BoardHistory trialHist(hist);
-          if(!trialHist.makeBoardMoveTolerant(trial,lib,board.colors[loc]))
-            continue;
-          //Only a REAL ladder escape counts: the extension must reach exactly two liberties and
-          //the opponent must be unable to run it down. "Extending into a big friendly group"
-          //(three or more liberties) is not a ladder escape and must not arm the correction.
-          if(trial.getNumLiberties(lib) != 2)
-            continue;
-          vector<Loc> b2;
+          Loc move = Board::NULL_LOC;
           int d = 0;
-          if(!trial.searchIsLadderCaptured(lib,false,b2,&d))
+          if(LzLadder::isRealLadderEscape(
+               board, hist, loc, pla, LzLadder::params.minStones, LzLadder::params.minDepth,
+               &move, &d)) {
+            if(getenv("LZ_LADDER_DEBUG") != NULL)
+              std::fprintf(stderr, "[LADR] armed at %s d=%d\n", Location::toString(move,board).c_str(), d);
             armed = 1;
+            break;
+          }
         }
       }
     }
