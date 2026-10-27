@@ -77,12 +77,13 @@ namespace LzLadder {
     double minPolicy;    //lzLadderMinPolicy: candidate policy floor (probability space)
     double policyFactor; //lzLadderPolicyFactor: demote-to factor below the penaltyRank move
     int penaltyRank;     //lzLadderPenaltyBase: rank index the demoted move drops below
-    int chaseStones;     //lzLadderChaseStones: min opponent-group size for chase demotion
+    int chaseStones;     //lzLadderChaseStones: min ladder stones already played for chase zeroing
     double boostFactor;  //lzLadderBoostFactor: >1 lifts a winning ladder capture above the top
     int defenseDepth;    //lzLadderDefenseDepth: min plies of the losing line before demotion
     bool offenseEnabled; //lzLadderOffenseEnabled: enable the futile-chase zeroing
     int offenseDepth;    //lzLadderOffenseDepth: chase length that counts as futile
     double boostWinrate; //lzLadderBoostWinrate: winrate nudge factor on a boosted capture
+    double penaltyWinrate;//lzLadderPenaltyWinrate: winrate nudge factor on a demoted/zeroed move
     int minDepth;        //lzLadderMinDepth: min remaining escape depth (plies) for the value correction
     double ladderValueBlend;//lzLadderEscapedValueBlend: blend for a solver-certified escaped group
 

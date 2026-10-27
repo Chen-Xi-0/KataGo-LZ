@@ -1130,19 +1130,18 @@ namespace LzLadder {
   std::atomic<int> rootArmed(0);
   Params::Params()
     : enabled(true), minStones(1),
-      checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(4),
+      checkNodes(10), minPolicy(5e-4), policyFactor(0.9), penaltyRank(2), chaseStones(2),
       boostFactor(2.0), defenseDepth(11), offenseEnabled(true), offenseDepth(6),
-      boostWinrate(0.3), minDepth(6), ladderValueBlend(0.8) {}
+      boostWinrate(0.3), penaltyWinrate(0.9), minDepth(6), ladderValueBlend(0.8) {}
 }
 
 //Shared certification predicates. The reference fork centralizes "is this a ladder escape"
 //in LadderDetection; the boost, the root arming scan and the escaped-group value blend all need
 //the same answer, so they call into one place instead of re-deriving it.
 namespace LzLadder {
-  //First empty liberty of the chain, plus how many empty neighbors the chain has in total.
-  static Loc findChainLiberty(const Board& board, Loc loc, int* outNumEmpty) {
+  //First empty liberty of the chain. A one-liberty group has exactly one by definition.
+  static Loc findChainLiberty(const Board& board, Loc loc) {
     Loc lib = Board::NULL_LOC;
-    int numEmpty = 0;
     Loc head = board.chain_head[loc];
     for(int y = 0; y < board.y_size; y++) {
       for(int x = 0; x < board.x_size; x++) {
@@ -1154,15 +1153,11 @@ namespace LzLadder {
           if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
             continue;
           Loc nb = Location::getLoc(nx,ny,board.x_size);
-          if(board.colors[nb] != C_EMPTY)
-            continue;
-          numEmpty++;
-          if(lib == Board::NULL_LOC)
-            lib = nb;
+          if(board.colors[nb] == C_EMPTY)
+            return nb;
         }
       }
     }
-    if(outNumEmpty != NULL) *outNumEmpty = numEmpty;
     return lib;
   }
 
@@ -1178,9 +1173,8 @@ namespace LzLadder {
       return false;
     if(board.getNumLiberties(loc) != 1 || board.getChainSize(loc) < minStones)
       return false;
-    int numEmpty = 0;
-    Loc lib = findChainLiberty(board, loc, &numEmpty);
-    if(lib == Board::NULL_LOC || numEmpty != 1)
+    Loc lib = findChainLiberty(board, loc);
+    if(lib == Board::NULL_LOC)
       return false;
     Board trial(board);
     BoardHistory trialHist(history);
@@ -1223,9 +1217,60 @@ namespace LzLadder {
       return false;
     if(d < minDepth)
       return false;
-    if(outMove != NULL) *outMove = findChainLiberty(board, loc, NULL);
+    if(outMove != NULL) *outMove = findChainLiberty(board, loc);
     if(outDepth != NULL) *outDepth = d;
     return true;
+  }
+
+  //Liberties of the played stone's chain right after each move of the history, reconstructed by
+  //replaying from the initial board (BoardHistory only retains the last 8 boards). Needed for
+  //the reference's ladder_counter, which asks how many ladder stones had exactly two liberties
+  //when they were played.
+  static std::vector<int> computeLadderLibsAfter(const BoardHistory& history) {
+    const std::vector<Move>& mh = history.moveHistory;
+    const int m = (int)mh.size();
+    std::vector<int> libsAfter((size_t)m, 0);
+    Board replay(history.initialBoard);
+    for(int i = 0; i < m; i++) {
+      const Move& mv = mh[i];
+      if(mv.loc <= Board::PASS_LOC)
+        continue;
+      replay.playMoveAssumeLegal(mv.loc, mv.pla);
+      if(replay.colors[mv.loc] == C_EMPTY)
+        continue;
+      libsAfter[i] = replay.getNumLiberties(mv.loc);
+    }
+    return libsAfter;
+  }
+
+  //Reference IsLadderChase's ladder_counter: walk the defender's moves backwards, count the
+  //stones that are now part of the chased chain and had two liberties when played. Stops at the
+  //first ladder stone that was not a two-liberty extension.
+  static int countLadderHistory(
+    const Board& curBoard, const BoardHistory& history, const std::vector<int>& libsAfter, Loc chasedLoc
+  ) {
+    const std::vector<Move>& mh = history.moveHistory;
+    const int m = (int)mh.size();
+    if(m <= 0 || (int)libsAfter.size() != m)
+      return 0;
+    int counter = 0;
+    Loc currentMove = chasedLoc;
+    for(int idx = m - 1; idx >= 0; idx -= 2) {
+      const Move& mv = mh[idx];
+      if(mv.loc <= Board::PASS_LOC)
+        break;
+      if(mv.loc == chasedLoc)
+        continue;
+      if(curBoard.chain_head[mv.loc] != curBoard.chain_head[currentMove])
+        continue;
+      if(libsAfter[idx] == 2) {
+        counter++;
+        currentMove = mv.loc;
+      }
+      else
+        break;
+    }
+    return counter;
   }
 }
 
@@ -1251,6 +1296,16 @@ static void applyLZLadderCorrectionV5(
   }
   if(maxLogit <= -1e24f)
     return;
+  //The reference skips the whole ladder surgery in a ko position (state->m_komove set): the
+  //ladder verdict is unreliable because the recapture may be illegal.
+  if(board.ko_loc != Board::NULL_LOC)
+    return;
+  //Original softmax denominator over legal moves, used by the winrate nudges.
+  float sumExp = 0.0f;
+  for(int pos = 0; pos<policySize; pos++) {
+    if(isLegal[pos])
+      sumExp += std::exp(policy[pos] - maxLogit);
+  }
 
   const bool suicideLegal = history.rules.multiStoneSuicideLegal;
   static const int NDX[4] = {1,-1,0,0};
@@ -1258,13 +1313,26 @@ static void applyLZLadderCorrectionV5(
   vector<Loc> buf;
   vector<Loc> workingMoves;
 
+  //Lazily computed liberty-after-move table for the reference's ladder_counter, shared by all
+  //candidates of this eval (the replay is O(history length)).
+  vector<int> ladderLibsAfter;
+  bool ladderLibsComputed = false;
+  const auto getLadderCounter = [&](const Board& curBoard, Loc chasedLoc) {
+    if(!ladderLibsComputed) {
+      ladderLibsAfter = LzLadder::computeLadderLibsAfter(history);
+      ladderLibsComputed = true;
+    }
+    return LzLadder::countLadderHistory(curBoard, history, ladderLibsAfter, chasedLoc);
+  };
+
   //Reference-fork (LK/lzl-src LadderDetection) semantics, ported:
   //  boost  : our move puts an OPPONENT group into atari (1 liberty, nothing captured) and that
   //           group cannot run the ladder -> winning ladder capture, lift this move's prior.
   //  demote : our move leaves an OWN two-liberty group that the opponent can ladder-capture and
   //           the losing line is deep enough and materially bad enough to be worth pricing.
-  //  chase  : "do not chase a group that escapes" stays DISABLED by default - we have no
-  //           chase-depth measure, and without it the rule over-triggers and removes good ataris.
+  //  chase  : our atari lands on a group that escapes; the chase length is the solver's escape
+  //           depth plus the ladder stones already played (reference IsLadderChase), and a move
+  //           deep enough into a futile chase is zeroed.
   //---------------------------------------------------------------------------
   //Group-driven rescue boost. The candidate-driven pass below only examines the top
   //`checkNodes` priors, so a correct escape move whose prior sits 30 ranks down is never
@@ -1362,6 +1430,7 @@ static void applyLZLadderCorrectionV5(
     Loc checkedHeads[4];
     int numChecked = 0;
     bool doBoost = false;
+    bool doZero = false;
     bool doDemote = false;
     for(int d = 0; d<4; d++) {
       const int nx = x + NDX[d];
@@ -1383,16 +1452,14 @@ static void applyLZLadderCorrectionV5(
         checkedHeads[numChecked++] = head;
 
       const int postLibs = copy.getNumLiberties(nb);
-      const int preLibs = board.getNumLiberties(nb);
       if(postLibs > 2)
         continue;
 
       if(col != nextPlayer) {
-        const int chainSize = copy.getChainSize(nb);
         //"Complete the ladder" from the defender's turn: he extends at his only liberty, then the
         //chase is played out. Gives BOTH numbers at once - captured (and how many plies to the
         //capture) or escaped (and how many plies the defender ran).
-        //The solver itself now reports the depth of its verdict (reference LadderDetection's
+        //The solver itself reports the depth of its verdict (reference LadderDetection's
         //max_depth / dead_depth): d < 0 = captured in -d plies, d > 0 = escaped, d = 0 unknown.
         int d = 0;
         bool capturedLine = false;
@@ -1404,10 +1471,14 @@ static void applyLZLadderCorrectionV5(
         //a single stone in a long ladder is exactly the case the value head cannot see.
         if(captured == 0 && postLibs == 1 && capturedLine && d <= -P.minDepth)
           doBoost = true;
-        //Reference offence penalty: our atari hits a group that gets out, after a long chase.
-        if(P.offenseEnabled && captured == 0 && postLibs == 1
-           && chainSize >= P.chaseStones && !capturedLine && d >= P.offenseDepth)
-          doDemote = true;
+        //Reference offence rule (IsLadderChase): our atari hits a group that gets out. The chase
+        //length is the remaining escape depth PLUS the ladder stones already played, and the
+        //reference zeroes the move when that reaches lzLadderOffenseDepth.
+        if(P.offenseEnabled && captured == 0 && postLibs == 1 && !capturedLine && d > 0) {
+          const int ladderCounter = getLadderCounter(copy, nb);
+          if(ladderCounter >= P.chaseStones && d + ladderCounter >= P.offenseDepth)
+            doZero = true;
+        }
       }
       else {
         //Reference defence rule: our move leaves an own two-liberty group that the opponent
@@ -1434,29 +1505,39 @@ static void applyLZLadderCorrectionV5(
       if(boostLogit > policy[pos]) {
         //Reference winrate surgery: the winrate change is scaled by the move's own probability
         //(a low-prior move gets a small nudge, a high-prior one a bigger one), so the position
-        //value stays honest. Original probability is logit-space softmax over legal moves.
-        if(winMulOut != NULL && P.boostWinrate > 0.0f) {
-          float sum = 0.0f;
-          for(int q = 0; q < policySize; q++) {
-            if(isLegal[q])
-              sum += std::exp(policy[q] - maxLogit);
-          }
-          if(sum > 0.0f) {
-            const float p = std::exp(policy[pos] - maxLogit) / sum;
-            *winMulOut *= (1.0f + p * (float)P.boostWinrate);
-          }
+        //value stays honest.
+        if(winMulOut != NULL && P.boostWinrate > 0.0f && sumExp > 0.0f) {
+          const float p = std::exp(policy[pos] - maxLogit) / sumExp;
+          *winMulOut *= (1.0f + p * (float)P.boostWinrate);
         }
         policy[pos] = boostLogit;
       }
     }
+    else if(doZero) {
+      //Reference offence penalty: reduce the winrate by the move's own prior, then zero the move.
+      if(winMulOut != NULL && P.penaltyWinrate > 0.0f && sumExp > 0.0f) {
+        const float p = std::exp(policy[pos] - maxLogit) / sumExp;
+        *winMulOut *= (1.0f - p * (float)P.penaltyWinrate);
+      }
+      policy[pos] = -1e30f;
+    }
     else if(doDemote) {
-      //Reference penalty semantics: cfg_ladder_penalty_base > 0 demotes the move to just below
-      //the penaltyRank-th candidate times policyFactor; only penalty_base == 0 zeroes it outright.
+      //Reference defence penalty: cfg_ladder_penalty_base > 0 demotes the move to just below the
+      //penaltyRank-th candidate times policyFactor and reduces the winrate with the demoted prior;
+      //penalty_base == 0 zeroes it outright.
       if(P.penaltyRank > 0) {
         if(demoteLogit < policy[pos])
           policy[pos] = demoteLogit;
+        if(winMulOut != NULL && P.penaltyWinrate > 0.0f && sumExp > 0.0f) {
+          const float p = std::exp(policy[pos] - maxLogit) / sumExp;
+          *winMulOut *= (1.0f - p * (float)P.penaltyWinrate);
+        }
       }
       else {
+        if(winMulOut != NULL && P.penaltyWinrate > 0.0f && sumExp > 0.0f) {
+          const float p = std::exp(policy[pos] - maxLogit) / sumExp;
+          *winMulOut *= (1.0f - p * (float)P.penaltyWinrate);
+        }
         policy[pos] = -1e30f;
       }
     }
