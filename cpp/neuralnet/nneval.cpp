@@ -1396,11 +1396,12 @@ static void applyLZLadderCorrectionV5(
         //max_depth / dead_depth): d < 0 = captured in -d plies, d > 0 = escaped, d = 0 unknown.
         int d = 0;
         bool capturedLine = false;
-        if(captured == 0 && postLibs <= 1 && chainSize >= P.chaseStones)
+        if(captured == 0 && postLibs <= 1)
           capturedLine = copy.searchIsLadderCaptured(nb,true,buf,&d);
         //Reference boost: our move puts an opponent group into atari that cannot escape. Only a
         //LONG ladder capture needs the prior lift: a short capture is visible to the value head.
-        //The solver's depth is negative here (plies to the capture).
+        //The solver's depth is negative here (plies to the capture). No group-size restriction:
+        //a single stone in a long ladder is exactly the case the value head cannot see.
         if(captured == 0 && postLibs == 1 && capturedLine && d <= -P.minDepth)
           doBoost = true;
         //Reference offence penalty: our atari hits a group that gets out, after a long chase.
