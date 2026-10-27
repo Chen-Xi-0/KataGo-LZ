@@ -58,6 +58,7 @@ static void loadLzLadderParams(ConfigParser& cfg) {
   if(cfg.contains("lzLadderOffenseDepth")) p.offenseDepth = cfg.getInt("lzLadderOffenseDepth",1,400);
   if(cfg.contains("lzLadderBoostWinrate")) p.boostWinrate = cfg.getDouble("lzLadderBoostWinrate",0.0,10.0);
   if(cfg.contains("lzLadderPenaltyWinrate")) p.penaltyWinrate = cfg.getDouble("lzLadderPenaltyWinrate",0.0,10.0);
+  if(cfg.contains("lzLadderMaxNodes")) p.ladderMaxNodes = cfg.getInt("lzLadderMaxNodes",100,1000000);
 }
 
 void Setup::initializeSession(ConfigParser& cfg) {

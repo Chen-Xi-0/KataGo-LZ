@@ -1578,7 +1578,7 @@ bool Board::hasLibertyGainingCaptures(Loc loc) const {
   return false;
 }
 
-bool Board::searchIsLadderCapturedAttackerFirst2Libs(Loc loc, vector<Loc>& buf, vector<Loc>& workingMoves) {
+bool Board::searchIsLadderCapturedAttackerFirst2Libs(Loc loc, vector<Loc>& buf, vector<Loc>& workingMoves, int* outDepth) {
   if(loc < 0 || loc >= MAX_ARR_SIZE)
     return false;
   if(colors[loc] != C_BLACK && colors[loc] != C_WHITE)
@@ -1598,6 +1598,9 @@ bool Board::searchIsLadderCapturedAttackerFirst2Libs(Loc loc, vector<Loc>& buf, 
   Loc move1 = buf[1];
   bool move0Works = false;
   bool move1Works = false;
+  int move0Depth = 0;
+  int move1Depth = 0;
+  if(outDepth != NULL) *outDepth = 0;
 
   //Suicide never relevant for ladders
   //Attacker: A suicide move cannot reduce the defender's liberties
@@ -1605,16 +1608,21 @@ bool Board::searchIsLadderCapturedAttackerFirst2Libs(Loc loc, vector<Loc>& buf, 
   bool isMultiStoneSuicideLegal = false;
   if(isLegal(move0,opp,isMultiStoneSuicideLegal)) {
     MoveRecord record = playMoveRecorded(move0,opp);
-    move0Works = searchIsLadderCaptured(loc,true,buf);
+    move0Works = searchIsLadderCaptured(loc,true,buf,&move0Depth);
     undo(record);
   }
   if(isLegal(move1,opp,isMultiStoneSuicideLegal)) {
     MoveRecord record = playMoveRecorded(move1,opp);
-    move1Works = searchIsLadderCaptured(loc,true,buf);
+    move1Works = searchIsLadderCaptured(loc,true,buf,&move1Depth);
     undo(record);
   }
 
   if(move0Works || move1Works) {
+    if(outDepth != NULL) {
+      const int d0 = move0Works ? move0Depth : 0;
+      const int d1 = move1Works ? move1Depth : 0;
+      *outDepth = (std::abs(d0) >= std::abs(d1)) ? d0 : d1;
+    }
     workingMoves.clear();
     if(move0Works)
       workingMoves.push_back(move0);
@@ -1625,7 +1633,7 @@ bool Board::searchIsLadderCapturedAttackerFirst2Libs(Loc loc, vector<Loc>& buf, 
   return false;
 }
 
-bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf) {
+bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf, int* outDepth) {
   if(loc < 0 || loc >= MAX_ARR_SIZE)
     return false;
   if(colors[loc] != C_BLACK && colors[loc] != C_WHITE)
@@ -1653,6 +1661,10 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
   int stackIdx = 0;
   int searchNodeCount = 0;
   static const int MAX_LADDER_SEARCH_NODE_BUDGET = 25000;
+  //Depth bookkeeping, mirroring the reference fork's LadderDetection: record how deep the
+  //conclusions were reached, separately for the escape and the capture verdicts.
+  int aliveDepth = 0;
+  int deadDepth = 0;
 
   moveListCur[0] = -1;
   moveListStarts[0] = 0;
@@ -1668,12 +1680,18 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
     if(stackIdx <= -1) {
       assert(stackIdx == -1);
       ko_loc = ko_loc_saved;
+      if(outDepth != NULL) {
+        if(returnValue)
+          *outDepth = -std::max(deadDepth, 1);
+        else
+          *outDepth = std::max(aliveDepth, 1);
+      }
       return returnValue;
     }
 
     //If we hit the stack limit, just consider it a failed ladder.
     if(stackIdx >= stackSize-1) {
-      returnValue = true; returnedFromDeeper = true; stackIdx--; continue;
+      returnValue = true; if(stackIdx > deadDepth) deadDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue;
     }
     //If we hit a total node count limit, then just assume it doesn't work.
     if(searchNodeCount >= MAX_LADDER_SEARCH_NODE_BUDGET) {
@@ -1682,6 +1700,7 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
         undo(records[stackIdx]);
         stackIdx -= 1;
       }
+      if(outDepth != NULL) *outDepth = 0;
       return false;
     }
 
@@ -1693,16 +1712,16 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
 
       //Base cases.
       //If we are the attacker and the group has only 1 liberty, we already win.
-      if(!isDefender && libs <= 1) { returnValue = true; returnedFromDeeper = true; stackIdx--; continue; }
+      if(!isDefender && libs <= 1) { returnValue = true; if(stackIdx > deadDepth) deadDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue; }
       //If we are the attacker and the group has 3 liberties, we already lose.
-      if(!isDefender && libs >= 3) { returnValue = false; returnedFromDeeper = true; stackIdx--; continue; }
+      if(!isDefender && libs >= 3) { returnValue = false; if(stackIdx > aliveDepth) aliveDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue; }
       //If we are the defender and the group has 2 liberties, we already win.
-      if(isDefender && libs >= 2) { returnValue = false; returnedFromDeeper = true; stackIdx--; continue; }
+      if(isDefender && libs >= 2) { returnValue = false; if(stackIdx > aliveDepth) aliveDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue; }
       //If we are the defender and the attacker left a simple ko point, assume we already win
       //because we don't want to say yes on ladders that depend on kos
       //This should also hopefully prevent any possible infinite loops - I don't know of any infinite loop
       //that would come up in a continuous atari sequence that doesn't ever leave a simple ko point.
-      if(isDefender && ko_loc != NULL_LOC) { returnValue = false; returnedFromDeeper = true; stackIdx--; continue; }
+      if(isDefender && ko_loc != NULL_LOC) { returnValue = false; if(stackIdx > aliveDepth) aliveDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue; }
 
       //Otherwise we need to keep searching.
       //Generate the move list. Attacker and defender generate moves on the group's liberties, but only the defender
@@ -1719,10 +1738,10 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
         getBoundNumLibertiesAfterPlay(buf[start+moveListLen-1], pla, lowerBoundLibs, upperBoundLibs);
         //Defender immediately wins if there are provably enough libs
         if(lowerBoundLibs >= 3)
-        { returnValue = false; returnedFromDeeper = true; stackIdx--; continue; }
+        { returnValue = false; if(stackIdx > aliveDepth) aliveDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue; }
         //Attacker immediately wins if defender has not enough libs and there are no alternatives
         if(moveListLen == 1 && upperBoundLibs <= 1)
-        { returnValue = true; returnedFromDeeper = true; stackIdx--; continue; }
+        { returnValue = true; if(stackIdx > deadDepth) deadDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue; }
       }
       else {
         moveListLen += findLiberties(loc,buf,start,start);
@@ -1750,7 +1769,7 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
         if(libs0 == 0 && libs1 == 0 && wouldBeKoCapture(buf[start],opp) && wouldBeKoCapture(buf[start+1],opp)) {
           if(getNumLibertiesAfterPlay(buf[start],pla,3) <= 2 && getNumLibertiesAfterPlay(buf[start+1],pla,3) <= 2) {
             if(!hasLibertyGainingCaptures(loc))
-            { returnValue = true; returnedFromDeeper = true; stackIdx--; continue; }
+            { returnValue = true; if(stackIdx > deadDepth) deadDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue; }
           }
         }
 
@@ -1759,7 +1778,7 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
         if(!Location::isAdjacent(buf[start],buf[start+1],x_size)) {
           //We lose automatically if both escapes get the defender too many libs
           if(libs0 >= 3 && libs1 >= 3)
-          { returnValue = false; returnedFromDeeper = true; stackIdx--; continue; }
+          { returnValue = false; if(stackIdx > aliveDepth) aliveDepth = stackIdx; returnedFromDeeper = true; stackIdx--; continue; }
           //Move 1 is not possible, so shrink the list
           else if(libs0 >= 3)
           { moveListLen = 1; }

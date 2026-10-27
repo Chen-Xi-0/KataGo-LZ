@@ -273,8 +273,8 @@ struct Board
 
   //Check if the given stone is in unescapable atari or can be put into unescapable atari.
   //WILL perform a mutable search - may alter the linked lists or heads, etc.
-  bool searchIsLadderCaptured(Loc loc, bool defenderFirst, std::vector<Loc>& buf);
-  bool searchIsLadderCapturedAttackerFirst2Libs(Loc loc, std::vector<Loc>& buf, std::vector<Loc>& workingMoves);
+  bool searchIsLadderCaptured(Loc loc, bool defenderFirst, std::vector<Loc>& buf, int* outDepth = NULL);
+  bool searchIsLadderCapturedAttackerFirst2Libs(Loc loc, std::vector<Loc>& buf, std::vector<Loc>& workingMoves, int* outDepth = NULL);
 
   //If a point is a pass-alive stone or pass-alive territory for a color, mark it that color.
   //If nonPassAliveStones, also marks non-pass-alive stones that are not part of the opposing pass-alive territory.
