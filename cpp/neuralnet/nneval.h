@@ -80,7 +80,10 @@ namespace LzLadder {
     double policyFactor; //lzLadderPolicyFactor: demote-to factor below the penaltyRank move
     int penaltyRank;     //lzLadderPenaltyBase: rank index the demoted move drops below
     int chaseStones;     //lzLadderChaseStones: min opponent-group size for chase demotion
-    double boostFactor;  //lzLadderBoostFactor: >1 lifts a proven-alive escape above the top
+    double boostFactor;  //lzLadderBoostFactor: >1 lifts a winning ladder capture above the top
+    int defenseDepth;    //lzLadderDefenseDepth: min plies of the losing line before demotion
+    bool offenseEnabled; //lzLadderOffenseEnabled: enable the futile-chase zeroing
+    int offenseDepth;    //lzLadderOffenseDepth: chase length that counts as futile
 
     Params();
   };
