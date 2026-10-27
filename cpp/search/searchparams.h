@@ -69,6 +69,9 @@ struct SearchParams {
   double rootDesiredPerChildVisitsCoeff; //Funnel sqrt(this * policy prob * total visits) down any given child that receives any visits at all at the root
 
   double rootPolicyOptimism; //Interpolate geometrically between raw policy and optimistic policy
+  //Experimental: weight (0..1) of the auxiliary score/ownership model's value in the search value.
+  //The policy stays the main model's; only winrate/score/lead are mixed. 0 disables it.
+  double auxValueWeight;
 
   //Parameters for choosing the move to play
   double chosenMoveTemperature; //Make move roughly proportional to visit count ** (1/chosenMoveTemperature)

@@ -348,6 +348,24 @@ bool Search::initNodeNNOutput(
     }
   }
 
+  //Experimental aux value mixing: blend the auxiliary model's value into the main model's value.
+  //The policy (and everything policy-driven) stays the main model's, so move selection remains
+  //unchanged; only winrate/score/lead are mixed. auxValueWeight = 0 disables this.
+  if(auxResult != NULL && *auxResult != NULL && searchParams.auxValueWeight > 0.0) {
+    const double w = std::min(1.0, std::max(0.0, searchParams.auxValueWeight));
+    std::shared_ptr<NNOutput> blended = std::make_shared<NNOutput>(**result);
+    const NNOutput& a = **auxResult;
+    blended->whiteWinProb = (float)((1.0-w)*blended->whiteWinProb + w*a.whiteWinProb);
+    blended->whiteLossProb = (float)((1.0-w)*blended->whiteLossProb + w*a.whiteLossProb);
+    blended->whiteNoResultProb = (float)((1.0-w)*blended->whiteNoResultProb + w*a.whiteNoResultProb);
+    blended->whiteScoreMean = (float)((1.0-w)*blended->whiteScoreMean + w*a.whiteScoreMean);
+    blended->whiteScoreMeanSq = (float)((1.0-w)*blended->whiteScoreMeanSq + w*a.whiteScoreMeanSq);
+    blended->whiteLead = (float)((1.0-w)*blended->whiteLead + w*a.whiteLead);
+    std::shared_ptr<NNOutput>* tmp = result;
+    result = new std::shared_ptr<NNOutput>(blended);
+    delete tmp;
+  }
+
   if(antiMirrorDifficult) {
     // Copy
     std::shared_ptr<NNOutput>* newNNOutputSharedPtr = new std::shared_ptr<NNOutput>(new NNOutput(**result));
