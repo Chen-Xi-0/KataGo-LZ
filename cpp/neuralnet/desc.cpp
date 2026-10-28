@@ -9,6 +9,7 @@
 #include "../neuralnet/modelversion.h"
 #include "../neuralnet/sgfmetadata.h"
 #include "../neuralnet/nninterface.h"
+#include "../neuralnet/lzconverter.h"
 
 #include "../core/test.h"
 
@@ -508,6 +509,23 @@ void MatMulLayerDesc::scaleOutputChannels(const std::vector<float>& scaling) {
   }
 }
 
+void MatMulLayerDesc::scaleInputChannels(const std::vector<float>& scaling) {
+  testAssert(weights.size() == inChannels * outChannels);
+  testAssert(scaling.size() > 0);
+  testAssert(inChannels % (int)scaling.size() == 0);
+  int numChannels = (int)scaling.size();
+  int numSpatial = inChannels / numChannels;
+  //Inputs are position-major, channel-minor: ic = pos * numChannels + c
+  for(int pos = 0; pos < numSpatial; pos++) {
+    for(int c = 0; c < numChannels; c++) {
+      int ic = pos * numChannels + c;
+      for(int oc = 0; oc < outChannels; oc++) {
+        weights[(size_t)oc + (size_t)ic * outChannels] *= scaling[c];
+      }
+    }
+  }
+}
+
 void MatMulLayerDesc::releaseWeights() {
   std::vector<float>().swap(weights);
 }
@@ -563,9 +581,10 @@ void MatBiasLayerDesc::releaseWeights() {
 
 //-----------------------------------------------------------------------------
 
-ResidualBlockDesc::ResidualBlockDesc() {}
+ResidualBlockDesc::ResidualBlockDesc() : hasPostNorm(false) {}
 
-ResidualBlockDesc::ResidualBlockDesc(istream& in, int modelVersion, bool binaryFloats) {
+ResidualBlockDesc::ResidualBlockDesc(istream& in, int modelVersion, bool binaryFloats, bool parsePostNorm)
+  : hasPostNorm(false) {
   in >> name;
   if(in.fail())
     throw StringError(name + ": res block failed to parse name");
@@ -576,6 +595,18 @@ ResidualBlockDesc::ResidualBlockDesc(istream& in, int modelVersion, bool binaryF
   midBN = BatchNormLayerDesc(in,binaryFloats);
   midActivation = ActivationLayerDesc(in,modelVersion);
   finalConv = ConvLayerDesc(in,binaryFloats);
+
+  if(parsePostNorm) {
+    postBN = BatchNormLayerDesc(in,binaryFloats);
+    postActivation = ActivationLayerDesc(in,modelVersion);
+    hasPostNorm = true;
+    if(postBN.numChannels != finalConv.outChannels)
+      throw StringError(
+        name + Global::strprintf(
+                 ": postnorm block postBN.numChannels (%d) != finalConv.outChannels (%d)",
+                 postBN.numChannels,
+                 finalConv.outChannels));
+  }
 
   if(preBN.numChannels != regularConv.inChannels)
     throw StringError(
@@ -606,6 +637,9 @@ ResidualBlockDesc& ResidualBlockDesc::operator=(ResidualBlockDesc&& other) {
   midBN = std::move(other.midBN);
   midActivation = std::move(other.midActivation);
   finalConv = std::move(other.finalConv);
+  postBN = std::move(other.postBN);
+  postActivation = std::move(other.postActivation);
+  hasPostNorm = other.hasPostNorm;
   return *this;
 }
 
@@ -619,14 +653,22 @@ double ResidualBlockDesc::getSpatialConvDepth() const {
 }
 
 int64_t ResidualBlockDesc::getNumParameters() const {
-  return
+  int64_t numParameters =
     preBN.getNumParameters() +
     regularConv.getNumParameters() +
     midBN.getNumParameters() +
     finalConv.getNumParameters();
+  if(hasPostNorm)
+    numParameters += postBN.getNumParameters();
+  return numParameters;
 }
 
 void ResidualBlockDesc::transformToReduceActivations() {
+  // Postnorm blocks carry weights folded from Leela Zero batch norms; keep them exactly as
+  // written so that inference replays the original network bit-for-bit (this transform is a
+  // pure optimization and skipping it is semantically neutral).
+  if(hasPostNorm)
+    return;
   // Merge in any multiplications by values less than 1.0 to happen earlier.
   std::vector<float> channelFactors;
   midBN.extractChannelFactorsAbsLtOne(channelFactors);
@@ -638,6 +680,10 @@ void ResidualBlockDesc::applyScale8ToReduceActivations() {
   preActivation.applyScale8ToReduceActivations();
   midBN.applyScale8ToReduceActivations();
   midActivation.applyScale8ToReduceActivations();
+  if(hasPostNorm) {
+    postBN.applyScale8ToReduceActivations();
+    postActivation.applyScale8ToReduceActivations();
+  }
 }
 
 void ResidualBlockDesc::releaseWeights() {
@@ -645,6 +691,8 @@ void ResidualBlockDesc::releaseWeights() {
   regularConv.releaseWeights();
   midBN.releaseWeights();
   finalConv.releaseWeights();
+  if(hasPostNorm)
+    postBN.releaseWeights();
 }
 
 //-----------------------------------------------------------------------------
@@ -839,7 +887,7 @@ NestedBottleneckResidualBlockDesc& NestedBottleneckResidualBlockDesc::operator=(
 void NestedBottleneckResidualBlockDesc::iterConvLayers(const std::function<void(const ConvLayerDesc& desc)>& f) const {
   f(preConv);
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       const ResidualBlockDesc* desc = (const ResidualBlockDesc*)blocks[i].second.get();
       desc->iterConvLayers(f);
     }
@@ -869,7 +917,7 @@ double NestedBottleneckResidualBlockDesc::getSpatialConvDepth() const {
   depth += preConv.getSpatialConvDepth();
 
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       const ResidualBlockDesc* desc = (const ResidualBlockDesc*)blocks[i].second.get();
       depth += desc->getSpatialConvDepth();
     }
@@ -905,7 +953,7 @@ int64_t NestedBottleneckResidualBlockDesc::getNumParameters() const {
   numParameters += preConv.getNumParameters();
 
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       const ResidualBlockDesc* desc = (const ResidualBlockDesc*)blocks[i].second.get();
       numParameters += desc->getNumParameters();
     }
@@ -943,21 +991,39 @@ static bool blocksContainTransformer(const std::vector<std::pair<int, unique_ptr
   return false;
 }
 
+//True if the block stack contains any postnorm block, at any nesting depth. The per-channel
+//scaling transforms below are not valid across a postnorm block's post-residual batch norm
+//(its bias term is not invariant to the flow scaling), so callers must skip them.
+static bool blocksContainPostnormRecursive(const std::vector<std::pair<int, unique_ptr_void>>& blocks) {
+  for(size_t i = 0; i < blocks.size(); i++) {
+    if(blocks[i].first == POSTNORM_BLOCK_KIND)
+      return true;
+    if(blocks[i].first == NESTED_BOTTLENECK_BLOCK_KIND) {
+      NestedBottleneckResidualBlockDesc* desc = (NestedBottleneckResidualBlockDesc*)blocks[i].second.get();
+      if(blocksContainPostnormRecursive(desc->blocks))
+        return true;
+    }
+  }
+  return false;
+}
+
 void NestedBottleneckResidualBlockDesc::transformToReduceActivations() {
   // Extract per-channel scale factors from postBN and push into adjacent layers.
-  // Skip the per-channel scaling if any immediate child is a transformer block
-  // (RMSNorm is not invariant to per-channel scaling). But still recurse into
-  // child blocks for their own internal optimizations.
+  // Skip the per-channel scaling if any child is a transformer block (RMSNorm is not
+  // invariant to per-channel scaling) or a postnorm block (its post-residual batch norm's
+  // bias is not invariant to the flow scaling). But still recurse into child blocks for
+  // their own internal optimizations.
   bool hasTransformerChild = blocksContainTransformer(blocks);
+  bool hasPostnormChild = blocksContainPostnormRecursive(blocks);
 
-  if(!hasTransformerChild) {
+  if(!hasTransformerChild && !hasPostnormChild) {
     std::vector<float> channelFactors;
     std::vector<float> invChannelFactors;
     postBN.extractChannelFactorsAbsLtOneWithInverses(channelFactors,invChannelFactors);
     preConv.scaleOutputChannels(channelFactors);
 
     for(size_t i = 0; i < blocks.size(); i++) {
-      if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+      if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
         ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
         desc->preBN.scaleInputChannels(invChannelFactors);
         desc->finalConv.scaleOutputChannels(channelFactors);
@@ -980,7 +1046,7 @@ void NestedBottleneckResidualBlockDesc::transformToReduceActivations() {
 
   // Recurse into child blocks for their own internal optimizations
   for(size_t i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
       desc->transformToReduceActivations();
     }
@@ -1007,7 +1073,7 @@ void NestedBottleneckResidualBlockDesc::applyScale8ToReduceActivations() {
   preActivation.applyScale8ToReduceActivations();
 
   for(size_t i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
       desc->applyScale8ToReduceActivations();
     }
@@ -1036,7 +1102,7 @@ void NestedBottleneckResidualBlockDesc::releaseWeights() {
   preBN.releaseWeights();
   preConv.releaseWeights();
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
       desc->releaseWeights();
     }
@@ -1478,6 +1544,34 @@ static void parseResidualBlockStack(
 
       blocks.emplace_back(ORDINARY_BLOCK_KIND, std::move(descPtr));
     }
+    else if(kind == "postnorm_block") {
+      unique_ptr_void descPtr = make_unique_void(new ResidualBlockDesc(in,modelVersion,binaryFloats,true));
+      ResidualBlockDesc& desc = *((ResidualBlockDesc*)descPtr.get());
+
+      if(desc.preBN.numChannels != trunkNumChannels)
+        throw StringError(
+          name + Global::strprintf(
+                   ": %s preBN.numChannels (%d) != trunkNumChannels (%d)",
+                   desc.name.c_str(),
+                   desc.preBN.numChannels,
+                   trunkNumChannels));
+      if(desc.finalConv.outChannels != trunkNumChannels)
+        throw StringError(
+          name + Global::strprintf(
+                   ": %s finalConv.outChannels (%d) != trunkNumChannels (%d)",
+                   desc.name.c_str(),
+                   desc.finalConv.outChannels,
+                   trunkNumChannels));
+      if(desc.postBN.numChannels != trunkNumChannels)
+        throw StringError(
+          name + Global::strprintf(
+                   ": %s postBN.numChannels (%d) != trunkNumChannels (%d)",
+                   desc.name.c_str(),
+                   desc.postBN.numChannels,
+                   trunkNumChannels));
+
+      blocks.emplace_back(POSTNORM_BLOCK_KIND, std::move(descPtr));
+    }
     else if(kind == "gpool_block") {
       unique_ptr_void descPtr = make_unique_void(new GlobalPoolingResidualBlockDesc(in, modelVersion, binaryFloats));
       GlobalPoolingResidualBlockDesc& desc = *((GlobalPoolingResidualBlockDesc*)descPtr.get());
@@ -1814,7 +1908,7 @@ TrunkDesc& TrunkDesc::operator=(TrunkDesc&& other) {
 void TrunkDesc::iterConvLayers(const std::function<void(const ConvLayerDesc& desc)>& f) const {
   f(initialConv);
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
       desc->iterConvLayers(f);
     }
@@ -1843,7 +1937,7 @@ double TrunkDesc::getSpatialConvDepth() const {
   depth += initialConv.getSpatialConvDepth();
 
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       const ResidualBlockDesc* desc = (const ResidualBlockDesc*)blocks[i].second.get();
       depth += desc->getSpatialConvDepth();
     }
@@ -1880,7 +1974,7 @@ int64_t TrunkDesc::getNumParameters() const {
     numParameters += sgfMetadataEncoder.getNumParameters();
 
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       const ResidualBlockDesc* desc = (const ResidualBlockDesc*)blocks[i].second.get();
       numParameters += desc->getNumParameters();
     }
@@ -1912,9 +2006,12 @@ int64_t TrunkDesc::getNumParameters() const {
 
 void TrunkDesc::transformToReduceActivations() {
   // Top-level per-channel scaling: extract factors from trunk tip BN and push into
-  // adjacent layers. This requires a standard BatchNorm trunk tip and no immediate-child
-  // transformer blocks (RMSNorm is not invariant to per-channel scaling).
-  bool canDoTopLevelScaling = (trunkNormKind == TRUNK_NORM_KIND_STANDARD) && !blocksContainTransformer(blocks);
+  // adjacent layers. This requires a standard BatchNorm trunk tip, no transformer blocks
+  // (RMSNorm is not invariant to per-channel scaling), and no postnorm blocks (their
+  // post-residual batch norm's bias is not invariant to the flow scaling).
+  bool canDoTopLevelScaling = (trunkNormKind == TRUNK_NORM_KIND_STANDARD)
+    && !blocksContainTransformer(blocks)
+    && !blocksContainPostnormRecursive(blocks);
 
   if(canDoTopLevelScaling) {
     std::vector<float> channelFactors;
@@ -1928,7 +2025,7 @@ void TrunkDesc::transformToReduceActivations() {
     }
 
     for(size_t i = 0; i < blocks.size(); i++) {
-      if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+      if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
         ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
         desc->preBN.scaleInputChannels(invChannelFactors);
         desc->finalConv.scaleOutputChannels(channelFactors);
@@ -1951,7 +2048,7 @@ void TrunkDesc::transformToReduceActivations() {
 
   // Always recurse into child blocks for their own internal optimizations
   for(size_t i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
       desc->transformToReduceActivations();
     }
@@ -1988,7 +2085,7 @@ void TrunkDesc::applyScale8ToReduceActivations() {
   trunkTipActivation.applyScale8ToReduceActivations();
 
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
       desc->applyScale8ToReduceActivations();
     }
@@ -2017,7 +2114,7 @@ void TrunkDesc::releaseWeights() {
   if(metaEncoderVersion > 0)
     sgfMetadataEncoder.releaseWeights();
   for(int i = 0; i < blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* desc = (ResidualBlockDesc*)blocks[i].second.get();
       desc->releaseWeights();
     }
@@ -2062,6 +2159,15 @@ PolicyHeadDesc::PolicyHeadDesc(istream& in, int vrsn, bool binaryFloats) {
     if(in.fail())
       throw StringError(name + ": policy head failed to parse policyOutChannels");
     // version 17 supports q value predictions based on whether channels are 2 (optimistic policy only) or 4 (optimistic policy + q winloss and score)
+    // Leela-Zero-style heads additionally allow 1 for plain single-channel policies, because they
+    // carry the policy through a full matmul instead of the conv+gpool path. That case only arises
+    // from the in-memory LZ converter (which never reaches this parser) and is gated on the
+    // explicit LZ marker rather than a version number, so a future upstream version 18 keeps its
+    // own semantics and never gets misread as an LZ net.
+    if(policyOutChannels == 1) {
+      //Reserved for Leela-Zero-style heads built by LZConverter; upstream nets do not use it.
+      throw StringError(name + ": policy head got invalid policyOutChannels 1 (only Leela-Zero-converted heads may use single-channel policies)");
+    }
     if(policyOutChannels != 2 && policyOutChannels != 4)
       throw StringError(name + ": policy head got invalid policyOutChannels " + Global::intToString(policyOutChannels));
   }
@@ -2084,6 +2190,11 @@ PolicyHeadDesc::PolicyHeadDesc(istream& in, int vrsn, bool binaryFloats) {
       throw StringError(name + ": model failed to parse unused params");
   }
 
+  //Reserved for Leela-Zero-style heads built by LZConverter, which never reaches this parser.
+  //Gated on an explicit marker rather than a version number so that a future upstream version 18
+  //keeps its own field layout instead of being misread as an LZ net.
+  hasFullPolicyMul = false;
+
   p1Conv = ConvLayerDesc(in,binaryFloats);
   g1Conv = ConvLayerDesc(in,binaryFloats);
   g1BN = BatchNormLayerDesc(in,binaryFloats);
@@ -2091,6 +2202,10 @@ PolicyHeadDesc::PolicyHeadDesc(istream& in, int vrsn, bool binaryFloats) {
   gpoolToBiasMul = MatMulLayerDesc(in,binaryFloats);
   p1BN = BatchNormLayerDesc(in,binaryFloats);
   p1Activation = ActivationLayerDesc(in,modelVersion);
+  if(hasFullPolicyMul) {
+    pFullMul = MatMulLayerDesc(in,binaryFloats);
+    pFullMulBias = MatBiasLayerDesc(in,binaryFloats);
+  }
   p2Conv = ConvLayerDesc(in,binaryFloats);
   gpoolToPassMul = MatMulLayerDesc(in,binaryFloats);
   if(modelVersion >= 15) {
@@ -2154,6 +2269,31 @@ PolicyHeadDesc::PolicyHeadDesc(istream& in, int vrsn, bool binaryFloats) {
     if(gpoolToPassMul.outChannels != policyOutChannels)
       throw StringError(name + Global::strprintf(": gpoolToPassMul.outChannels (%d) != %d", gpoolToPassMul.outChannels, policyOutChannels));
   }
+
+  if(hasFullPolicyMul) {
+    //pFullMul consumes the flattened spatial p1Activation output and produces
+    //policyOutChannels * (numSpatial + 1) outputs: per-position logits plus the pass logit(s).
+    if(p1BN.numChannels <= 0 || pFullMul.inChannels % p1BN.numChannels != 0)
+      throw StringError(
+        name + Global::strprintf(
+                 ": pFullMul.inChannels (%d) is not divisible by p1BN.numChannels (%d)",
+                 pFullMul.inChannels,
+                 p1BN.numChannels));
+    int numSpatial = pFullMul.inChannels / p1BN.numChannels;
+    if(pFullMul.outChannels != policyOutChannels * (numSpatial + 1))
+      throw StringError(
+        name + Global::strprintf(
+                 ": pFullMul.outChannels (%d) != policyOutChannels (%d) * (numSpatial (%d) + 1)",
+                 pFullMul.outChannels,
+                 policyOutChannels,
+                 numSpatial));
+    if(pFullMulBias.numChannels != pFullMul.outChannels)
+      throw StringError(
+        name + Global::strprintf(
+                 ": pFullMulBias.numChannels (%d) != pFullMul.outChannels (%d)",
+                 pFullMulBias.numChannels,
+                 pFullMul.outChannels));
+  }
 }
 
 PolicyHeadDesc::~PolicyHeadDesc() {}
@@ -2173,6 +2313,9 @@ PolicyHeadDesc& PolicyHeadDesc::operator=(PolicyHeadDesc&& other) {
   gpoolToBiasMul = std::move(other.gpoolToBiasMul);
   p1BN = std::move(other.p1BN);
   p1Activation = std::move(other.p1Activation);
+  hasFullPolicyMul = other.hasFullPolicyMul;
+  pFullMul = std::move(other.pFullMul);
+  pFullMulBias = std::move(other.pFullMulBias);
   p2Conv = std::move(other.p2Conv);
   gpoolToPassMul = std::move(other.gpoolToPassMul);
   gpoolToPassBias = std::move(other.gpoolToPassBias);
@@ -2194,6 +2337,8 @@ int64_t PolicyHeadDesc::getNumParameters() const {
     g1BN.getNumParameters() +
     gpoolToBiasMul.getNumParameters() +
     p1BN.getNumParameters() +
+    pFullMul.getNumParameters() +      // empty unless hasFullPolicyMul
+    pFullMulBias.getNumParameters() +  // empty unless hasFullPolicyMul
     p2Conv.getNumParameters() +
     gpoolToPassMul.getNumParameters() +
     gpoolToPassBias.getNumParameters() +
@@ -2202,12 +2347,19 @@ int64_t PolicyHeadDesc::getNumParameters() const {
 
 
 void PolicyHeadDesc::transformToReduceActivations() {
+  // The Leela-Zero-style full policy matmul head carries weights folded from the original
+  // network; keep them exactly as written so inference replays it faithfully (this transform
+  // is a pure optimization and skipping it is semantically neutral).
+  if(hasFullPolicyMul)
+    return;
   // Merge in any multiplications by values less than 1.0 to happen earlier.
   {
     std::vector<float> channelFactors;
     p1BN.extractChannelFactorsAbsLtOne(channelFactors);
     p1Conv.scaleOutputChannels(channelFactors);
     gpoolToBiasMul.scaleOutputChannels(channelFactors);
+    if(hasFullPolicyMul)
+      pFullMul.scaleInputChannels(channelFactors);
   }
   {
     std::vector<float> channelFactors;
@@ -2223,6 +2375,10 @@ void PolicyHeadDesc::applyScale8ToReduceActivations() {
   p1Activation.applyScale8ToReduceActivations();
   gpoolToPassBias.applyScale8ToReduceActivations();
   passActivation.applyScale8ToReduceActivations();
+  //The full-policy matmul consumes the scaled spatial activations, so its bias must be scaled
+  //the same way as the other downstream biases in order for the final logits to be scaled by 1/8.
+  if(hasFullPolicyMul)
+    pFullMulBias.applyScale8ToReduceActivations();
 }
 
 void PolicyHeadDesc::releaseWeights() {
@@ -2231,6 +2387,8 @@ void PolicyHeadDesc::releaseWeights() {
   g1BN.releaseWeights();
   gpoolToBiasMul.releaseWeights();
   p1BN.releaseWeights();
+  pFullMul.releaseWeights();
+  pFullMulBias.releaseWeights();
   p2Conv.releaseWeights();
   gpoolToPassMul.releaseWeights();
   gpoolToPassBias.releaseWeights();
@@ -2260,6 +2418,11 @@ ValueHeadDesc::ValueHeadDesc(istream& in, int vrsn, bool binaryFloats) {
       throw StringError(name + ": model failed to parse unused params");
   }
 
+  //Reserved for Leela-Zero-style heads built by LZConverter, which never reaches this parser.
+  //Gated on an explicit marker rather than a version number so that a future upstream version 18
+  //keeps its own field layout instead of being misread as an LZ net.
+  hasFullValueMul = false;
+
   v1Conv = ConvLayerDesc(in,binaryFloats);
   v1BN = BatchNormLayerDesc(in,binaryFloats);
   v1Activation = ActivationLayerDesc(in,modelVersion);
@@ -2281,7 +2444,18 @@ ValueHeadDesc::ValueHeadDesc(istream& in, int vrsn, bool binaryFloats) {
       name +
       Global::strprintf(": v1Conv.outChannels (%d) != v1BN.numChannels (%d)", v1Conv.outChannels, v1BN.numChannels));
 
-  if(v2Mul.inChannels != v1BN.numChannels * 3)
+  if(hasFullValueMul) {
+    //v2Mul consumes the flattened spatial v1Activation output: nnXLen*nnYLen positions each with
+    //v1BN.numChannels channels. The exact board size is only known to the backend, so here we can
+    //only check divisibility; the backend verifies the full nnXLen*nnYLen match at apply time.
+    if(v1BN.numChannels <= 0 || v2Mul.inChannels % v1BN.numChannels != 0)
+      throw StringError(
+        name + Global::strprintf(
+                 ": v2Mul.inChannels (%d) is not divisible by v1BN.numChannels (%d)",
+                 v2Mul.inChannels,
+                 v1BN.numChannels));
+  }
+  else if(v2Mul.inChannels != v1BN.numChannels * 3)
     throw StringError(
       name + Global::strprintf(
                ": v2Mul.inChannels (%d) != v1BN.numChannels*3 (%d)", v2Mul.inChannels, v1BN.numChannels * 3));
@@ -2348,6 +2522,7 @@ ValueHeadDesc::ValueHeadDesc(ValueHeadDesc&& other) {
 ValueHeadDesc& ValueHeadDesc::operator=(ValueHeadDesc&& other) {
   name = std::move(other.name);
   modelVersion = other.modelVersion;
+  hasFullValueMul = other.hasFullValueMul;
   v1Conv = std::move(other.v1Conv);
   v1BN = std::move(other.v1BN);
   v1Activation = std::move(other.v1Activation);
@@ -2381,10 +2556,16 @@ int64_t ValueHeadDesc::getNumParameters() const {
 }
 
 void ValueHeadDesc::transformToReduceActivations() {
+  // See PolicyHeadDesc::transformToReduceActivations: keep Leela-Zero-style full value matmul
+  // weights exactly as written.
+  if(hasFullValueMul)
+    return;
   // Merge in any multiplications by values less than 1.0 to happen earlier.
   std::vector<float> channelFactors;
   v1BN.extractChannelFactorsAbsLtOne(channelFactors);
   v1Conv.scaleOutputChannels(channelFactors);
+  if(hasFullValueMul)
+    v2Mul.scaleInputChannels(channelFactors);
 }
 
 
@@ -2458,6 +2639,8 @@ ModelDesc::ModelDesc()
     metaEncoderVersion(0),
     preferPassAliveUnderSuicideRules(false),
     preferExcludeTerritoryAdjacentToAtari(false),
+    valueFromBlackPerspective(false),
+    isLZModel(false),
     postProcessParams(),
     archSummary()
 {}
@@ -2465,6 +2648,7 @@ ModelDesc::ModelDesc()
 ModelDesc::ModelDesc(istream& in, const string& sha256_, bool binaryFloats) {
   in >> name;
   sha256 = sha256_;
+  isLZModel = false;
   in >> modelVersion;
   if(in.fail())
     throw StringError("Model failed to parse name or version. Is this a valid model file? You probably specified the wrong file.");
@@ -2601,6 +2785,11 @@ ModelDesc::ModelDesc(istream& in, const string& sha256_, bool binaryFloats) {
     preferExcludeTerritoryAdjacentToAtari = false;
   }
 
+  //Reserved for Leela-Zero-style heads built by LZConverter, which never reaches this parser.
+  //Gated on an explicit marker rather than a version number so that a future upstream version 18
+  //keeps its own field layout instead of being misread as an LZ net.
+  valueFromBlackPerspective = false;
+
   trunk = TrunkDesc(in, modelVersion, binaryFloats, metaEncoderVersion);
   policyHead = PolicyHeadDesc(in, modelVersion, binaryFloats);
   valueHead = ValueHeadDesc(in, modelVersion, binaryFloats);
@@ -2666,6 +2855,8 @@ ModelDesc& ModelDesc::operator=(ModelDesc&& other) {
   metaEncoderVersion = other.metaEncoderVersion;
   preferPassAliveUnderSuicideRules = other.preferPassAliveUnderSuicideRules;
   preferExcludeTerritoryAdjacentToAtari = other.preferExcludeTerritoryAdjacentToAtari;
+  valueFromBlackPerspective = other.valueFromBlackPerspective;
+  isLZModel = other.isLZModel;
   postProcessParams = other.postProcessParams;
   archSummary = other.archSummary;
   trunk = std::move(other.trunk);
@@ -2808,9 +2999,15 @@ void ModelDesc::loadFromFileMaybeGZipped(const string& fileName, ModelDesc& desc
       string uncompressed;
       string sha256Buf;
       FileUtils::loadFileIntoString(fileName,expectedSha256,uncompressed,&sha256Buf);
-      NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
-      std::istream uncompressedIn(&uncompressedStreamBuf);
-      descBuf = ModelDesc(uncompressedIn,sha256Buf,binaryFloats);
+      if(LZConverter::looksLikeLZ(uncompressed)) {
+        descBuf = ModelDesc();
+        LZConverter::buildModelDesc(uncompressed,sha256Buf,descBuf);
+      }
+      else {
+        NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
+        std::istream uncompressedIn(&uncompressedStreamBuf);
+        descBuf = ModelDesc(uncompressedIn,sha256Buf,binaryFloats);
+      }
     }
     else if(Global::isSuffix(lower,".bin")) {
       bool binaryFloats = true;
@@ -2826,28 +3023,36 @@ void ModelDesc::loadFromFileMaybeGZipped(const string& fileName, ModelDesc& desc
       string sha256Buf;
       FileUtils::uncompressAndLoadFileIntoString(fileName,expectedSha256,uncompressed,&sha256Buf);
 
-      bool binaryFloats = !Global::isSuffix(lower,".txt.gz");
-      try {
-        //Now, initialize an istream to read from the string
-        NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
-        std::istream uncompressedIn(&uncompressedStreamBuf);
-        //And read in the model desc
-        descBuf = ModelDesc(uncompressedIn,sha256Buf,binaryFloats);
+      //Leela Zero / ELF text weights are converted in-memory instead of going through the
+      //KataGo model parser. Only plain text candidates are sniffed (.bin.gz is binary floats).
+      if(!Global::isSuffix(lower,".bin.gz") && LZConverter::looksLikeLZ(uncompressed)) {
+        descBuf = ModelDesc();
+        LZConverter::buildModelDesc(uncompressed,sha256Buf,descBuf);
       }
-      catch(const StringError& e) {
-        //On failure, try again to read as a .txt.gz file if the extension was ambiguous
-        bool tryAgain = binaryFloats && !Global::isSuffix(lower,".bin.gz");
-        if(!tryAgain)
-          throw;
-        else {
-          binaryFloats = false;
-          try {
-            NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
-            std::istream uncompressedIn(&uncompressedStreamBuf);
-            descBuf = ModelDesc(uncompressedIn,sha256Buf,binaryFloats);
-          }
-          catch(const StringError& e2) {
-            throw StringError(string("Could neither parse .gz model as .txt.gz model nor as .bin.gz model, errors were:\n") + e2.what() + "\n" + e.what());
+      else {
+        bool binaryFloats = !Global::isSuffix(lower,".txt.gz");
+        try {
+          //Now, initialize an istream to read from the string
+          NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
+          std::istream uncompressedIn(&uncompressedStreamBuf);
+          //And read in the model desc
+          descBuf = ModelDesc(uncompressedIn,sha256Buf,binaryFloats);
+        }
+        catch(const StringError& e) {
+          //On failure, try again to read as a .txt.gz file if the extension was ambiguous
+          bool tryAgain = binaryFloats && !Global::isSuffix(lower,".bin.gz");
+          if(!tryAgain)
+            throw;
+          else {
+            binaryFloats = false;
+            try {
+              NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
+              std::istream uncompressedIn(&uncompressedStreamBuf);
+              descBuf = ModelDesc(uncompressedIn,sha256Buf,binaryFloats);
+            }
+            catch(const StringError& e2) {
+              throw StringError(string("Could neither parse .gz model as .txt.gz model nor as .bin.gz model, errors were:\n") + e2.what() + "\n" + e.what());
+            }
           }
         }
       }

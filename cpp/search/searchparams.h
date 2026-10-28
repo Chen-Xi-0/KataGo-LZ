@@ -121,6 +121,16 @@ struct SearchParams {
   float nnPolicyTemperature; //Scale neural net policy probabilities by this temperature, applies everywhere in the tree
   bool antiMirror; //Enable anti-mirroring logic
 
+  //Dynamic komi (LZ color-plane trick): adjust a virtual komi folded into the LZ-compatible net inputs
+  //so that white's winrate stays in [minWr, maxWr]. Only has an effect with model version 18 inputs.
+  //Off by default. targetKomi doubles as the neutral point and the lower bound for concessions:
+  //7.5 for handicap play, 0 for endgame "no concession".
+  bool useDynamicKomi;
+  float dynamicKomiMaxWr;
+  float dynamicKomiMinWr;
+  float dynamicKomiMidWr;
+  float dynamicKomiTargetKomi;
+
   //Ignore history prior to the root of the search. This is enforced strictly only for the root node of the
   //search. Deeper nodes may see history prior to the root of the search if searches were performed from earlier positions
   //and those gamestates were also reached by those earlier searches with the nn evals cached.

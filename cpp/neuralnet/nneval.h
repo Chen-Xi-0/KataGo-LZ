@@ -153,6 +153,7 @@ class NNEvaluator {
   int getNNYLen() const;
   bool getRequireExactNNLen() const;
   int getModelVersion() const;
+  bool isLZModel() const;
   double getTrunkSpatialConvDepth() const;
   int64_t getNumModelParameters() const;
   bool modelHasAnyTransformerBlocks() const;
@@ -284,8 +285,14 @@ class NNEvaluator {
 
   std::string internalModelName;
   int modelVersion;
+  //True if the loaded model was converted from Leela Zero / ELF weights (see ModelDesc::isLZModel).
+  bool isLZModelFlag;
   int inputsVersion;
   int numInputMetaChannels;
+
+  //True if the value head's (win,loss,draw) triple is from black's perspective rather than the
+  //perspective of the player to move (model version 18+, e.g. Leela Zero v2/ELF nets).
+  bool valueFromBlackPerspective;
 
   ModelPostProcessParams postProcessParams;
 

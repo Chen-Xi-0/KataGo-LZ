@@ -1031,6 +1031,7 @@ add_executable(katago
   neuralnet/modelversion.cpp
   neuralnet/nneval.cpp
   neuralnet/desc.cpp
+  neuralnet/lzconverter.cpp
   neuralnet/debugprint.cpp
   ${NEURALNET_BACKEND_SOURCES}
   book/book.cpp

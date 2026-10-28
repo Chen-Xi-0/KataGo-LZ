@@ -776,6 +776,34 @@ vector<SearchParams> Setup::loadParams(
     else if(cfg.contains("antiMirror"))   params.antiMirror = cfg.getBool("antiMirror");
     else                                  params.antiMirror = false;
 
+    if(cfg.contains("useDynamicKomi"+idxStr)) params.useDynamicKomi = cfg.getBool("useDynamicKomi"+idxStr);
+    else if(cfg.contains("useDynamicKomi"))   params.useDynamicKomi = cfg.getBool("useDynamicKomi");
+    else                                      params.useDynamicKomi = false;
+    if(cfg.contains("dynamicKomiMaxWr"+idxStr))
+      params.dynamicKomiMaxWr = cfg.getFloat("dynamicKomiMaxWr"+idxStr,0.0f,1.0f);
+    else if(cfg.contains("dynamicKomiMaxWr"))
+      params.dynamicKomiMaxWr = cfg.getFloat("dynamicKomiMaxWr",0.0f,1.0f);
+    else
+      params.dynamicKomiMaxWr = 0.5f;
+    if(cfg.contains("dynamicKomiMinWr"+idxStr))
+      params.dynamicKomiMinWr = cfg.getFloat("dynamicKomiMinWr"+idxStr,0.0f,1.0f);
+    else if(cfg.contains("dynamicKomiMinWr"))
+      params.dynamicKomiMinWr = cfg.getFloat("dynamicKomiMinWr",0.0f,1.0f);
+    else
+      params.dynamicKomiMinWr = 0.1f;
+    if(cfg.contains("dynamicKomiMidWr"+idxStr))
+      params.dynamicKomiMidWr = cfg.getFloat("dynamicKomiMidWr"+idxStr,0.0f,1.0f);
+    else if(cfg.contains("dynamicKomiMidWr"))
+      params.dynamicKomiMidWr = cfg.getFloat("dynamicKomiMidWr",0.0f,1.0f);
+    else
+      params.dynamicKomiMidWr = 0.4f;
+    if(cfg.contains("dynamicKomiTargetKomi"+idxStr))
+      params.dynamicKomiTargetKomi = cfg.getFloat("dynamicKomiTargetKomi"+idxStr,-100.0f,100.0f);
+    else if(cfg.contains("dynamicKomiTargetKomi"))
+      params.dynamicKomiTargetKomi = cfg.getFloat("dynamicKomiTargetKomi",-100.0f,100.0f);
+    else
+      params.dynamicKomiTargetKomi = 7.5f;
+
     if(cfg.contains("ignorePreRootHistory"+idxStr)) params.ignorePreRootHistory = cfg.getBool("ignorePreRootHistory"+idxStr);
     else if(cfg.contains("ignorePreRootHistory"))   params.ignorePreRootHistory = cfg.getBool("ignorePreRootHistory");
     else                                            params.ignorePreRootHistory = (setupFor == SETUP_FOR_ANALYSIS ? Setup::DEFAULT_ANALYSIS_IGNORE_PRE_ROOT_HISTORY : false);

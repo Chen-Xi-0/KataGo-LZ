@@ -891,6 +891,9 @@ AnalysisData Search::getAnalysisDataOfSingleChild(
   double noResultValueAvg = 0.0;
   double scoreMeanAvg = 0.0;
   double scoreMeanSqAvg = 0.0;
+  double auxScoreMeanAvg = 0.0;
+  double auxScoreMeanSqAvg = 0.0;
+  double auxLeadAvg = 0.0;
   double leadAvg = 0.0;
   double utilityAvg = 0.0;
   double utilitySqAvg = 0.0;
@@ -904,6 +907,11 @@ AnalysisData Search::getAnalysisDataOfSingleChild(
     noResultValueAvg = child->stats.noResultValueAvg.load(std::memory_order_acquire);
     scoreMeanAvg = child->stats.scoreMeanAvg.load(std::memory_order_acquire);
     scoreMeanSqAvg = child->stats.scoreMeanSqAvg.load(std::memory_order_acquire);
+    if(auxEvaluator != NULL) {
+      auxScoreMeanAvg = child->stats.auxScoreMeanAvg.load(std::memory_order_acquire);
+      auxScoreMeanSqAvg = child->stats.auxScoreMeanSqAvg.load(std::memory_order_acquire);
+      auxLeadAvg = child->stats.auxLeadAvg.load(std::memory_order_acquire);
+    }
     leadAvg = child->stats.leadAvg.load(std::memory_order_acquire);
     utilityAvg = child->stats.utilityAvg.load(std::memory_order_acquire);
     utilitySqAvg = child->stats.utilitySqAvg.load(std::memory_order_acquire);
@@ -943,14 +951,24 @@ AnalysisData Search::getAnalysisDataOfSingleChild(
     data.scoreUtility = getScoreUtility(scoreMeanAvg, scoreMeanSqAvg);
     data.winLossValue = winLossValueAvg;
     data.noResultValue = noResultValueAvg;
-    data.scoreMean = scoreMeanAvg;
-    data.scoreStdev = ScoreValue::getScoreStdev(scoreMeanAvg,scoreMeanSqAvg);
-    data.lead = leadAvg;
+    //Score and lead are reported from the auxiliary evaluator when one is configured.
+    //Winrate, utility, and search selection remain entirely from the main (LZ) evaluator.
+    if(auxEvaluator != NULL) {
+      data.scoreMean = auxScoreMeanAvg;
+      data.scoreStdev = ScoreValue::getScoreStdev(auxScoreMeanAvg,auxScoreMeanSqAvg);
+      data.lead = auxLeadAvg;
+      data.scoreMeanSqAvg = auxScoreMeanSqAvg;
+    }
+    else {
+      data.scoreMean = scoreMeanAvg;
+      data.scoreStdev = ScoreValue::getScoreStdev(scoreMeanAvg,scoreMeanSqAvg);
+      data.lead = leadAvg;
+      data.scoreMeanSqAvg = scoreMeanSqAvg;
+    }
     data.ess = weightSum * weightSum / std::max(1e-8,weightSqSum);
     data.weightSum = weightSum;
     data.weightSqSum = weightSqSum;
     data.utilitySqAvg = utilitySqAvg;
-    data.scoreMeanSqAvg = scoreMeanSqAvg;
     data.childVisits = childVisits;
     data.childWeightSum = childWeightSum;
   }
@@ -1064,6 +1082,11 @@ void Search::getAnalysisData(
     assert(weightSum > 0.0);
 
     parentWinLossValue = winLossValueAvg;
+    if(auxEvaluator != NULL) {
+      scoreMeanAvg = node.stats.auxScoreMeanAvg.load(std::memory_order_acquire);
+      scoreMeanSqAvg = node.stats.auxScoreMeanSqAvg.load(std::memory_order_acquire);
+      leadAvg = node.stats.auxLeadAvg.load(std::memory_order_acquire);
+    }
     parentScoreMean = scoreMeanAvg;
     parentScoreStdev = ScoreValue::getScoreStdev(parentScoreMean,scoreMeanSqAvg);
     parentLead = leadAvg;
@@ -1764,7 +1787,8 @@ bool Search::getSharpScoreHelper(
 vector<double> Search::getAverageTreeOwnership(const SearchNode* node) const {
   if(node == NULL)
     node = rootNode;
-  if(!alwaysIncludeOwnerMap)
+  //When an auxiliary evaluator is configured, ownership always comes from it and is always available.
+  if(!alwaysIncludeOwnerMap && auxEvaluator == NULL)
     throw StringError("Called Search::getAverageTreeOwnership when alwaysIncludeOwnerMap is false");
   vector<double> vec(nnXLen*nnYLen,0.0);
   auto accumulate = [&vec,this](const float* ownership, double selfProp){
@@ -1826,10 +1850,19 @@ bool Search::traverseTreeForOwnership(
   if(nnOutput == NULL)
     return false;
 
+  //Ownership is read from the auxiliary evaluator if one is configured, otherwise from the main evaluator.
+  const NNOutput* ownershipOutput = nnOutput;
+  if(auxEvaluator != NULL) {
+    ownershipOutput = node->getAuxOutput();
+    if(ownershipOutput == NULL)
+      return false;
+  }
+
   // Base case
   if(desiredProp < minProp) {
-    float* ownerMap = nnOutput->whiteOwnerMap;
-    assert(ownerMap != NULL);
+    float* ownerMap = ownershipOutput->whiteOwnerMap;
+    if(ownerMap == NULL)
+      return false;
     accumulate(ownerMap, desiredProp);
     return true;
   }
@@ -1838,8 +1871,9 @@ bool Search::traverseTreeForOwnership(
   int childrenCapacity = children.getCapacity();
 
   if(childrenCapacity <= 0) {
-    float* ownerMap = nnOutput->whiteOwnerMap;
-    assert(ownerMap != NULL);
+    float* ownerMap = ownershipOutput->whiteOwnerMap;
+    if(ownerMap == NULL)
+      return false;
     accumulate(ownerMap, desiredProp);
     return true;
   }
@@ -1848,8 +1882,9 @@ bool Search::traverseTreeForOwnership(
   // No insertion, node was already there, this means we hit a cycle in the graph
   if(!result.second) {
     //Just treat it as base case and immediately terminate.
-    float* ownerMap = nnOutput->whiteOwnerMap;
-    assert(ownerMap != NULL);
+    float* ownerMap = ownershipOutput->whiteOwnerMap;
+    if(ownerMap == NULL)
+      return false;
     accumulate(ownerMap, desiredProp);
     return true;
   }
@@ -1871,8 +1906,9 @@ bool Search::traverseTreeForOwnership(
 
   graphPath.erase(node);
 
-  float* ownerMap = nnOutput->whiteOwnerMap;
-  assert(ownerMap != NULL);
+  float* ownerMap = ownershipOutput->whiteOwnerMap;
+  if(ownerMap == NULL)
+    return false;
   accumulate(ownerMap, selfProp);
   return true;
 }

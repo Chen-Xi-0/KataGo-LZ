@@ -1209,6 +1209,70 @@ cl_int OpenCLHelpers::doAddPointWise(
   return err;
 }
 
+cl_int OpenCLHelpers::doPolicyFullSplit(
+  cl_kernel kernel,
+  cl_command_queue commandQueue,
+  cl_mem full,
+  cl_mem policy,
+  cl_mem policyPass,
+  int batchSize,
+  int numSpatial,
+  int paddedNNXYLen,
+  int numPolicyChannels,
+  int numOutChannels,
+  cl_event* eventBuf
+) {
+  clSetKernelArg(kernel, 0, sizeof(cl_mem), (const void *)&full);
+  clSetKernelArg(kernel, 1, sizeof(cl_mem), (const void *)&policy);
+  clSetKernelArg(kernel, 2, sizeof(cl_mem), (const void *)&policyPass);
+  clSetKernelArg(kernel, 3, sizeof(int), (const void *)&numSpatial);
+  clSetKernelArg(kernel, 4, sizeof(int), (const void *)&paddedNNXYLen);
+  clSetKernelArg(kernel, 5, sizeof(int), (const void *)&numPolicyChannels);
+  clSetKernelArg(kernel, 6, sizeof(int), (const void *)&numOutChannels);
+
+  size_t localSize = 64;
+  static constexpr int nKernelDims = 2;
+  size_t globalSizes[nKernelDims] = {roundUpToMultiple((size_t)numSpatial, localSize), (size_t)batchSize};
+  size_t localSizes[nKernelDims] = {localSize, 1};
+
+  cl_int err;
+  err = clEnqueueNDRangeKernel(
+    commandQueue, kernel, nKernelDims, NULL, globalSizes, localSizes, 0, NULL, eventBuf
+  );
+  return err;
+}
+
+cl_int OpenCLHelpers::doFullMatMul(
+  cl_kernel kernel,
+  cl_command_queue commandQueue,
+  cl_mem input,
+  cl_mem weights,
+  cl_mem output,
+  int batchSize,
+  int numChannels,
+  int xySize,
+  int outChannels,
+  cl_event* eventBuf
+) {
+  clSetKernelArg(kernel, 0, sizeof(cl_mem), (const void *)&input);
+  clSetKernelArg(kernel, 1, sizeof(cl_mem), (const void *)&weights);
+  clSetKernelArg(kernel, 2, sizeof(cl_mem), (const void *)&output);
+  clSetKernelArg(kernel, 3, sizeof(int), (const void *)&numChannels);
+  clSetKernelArg(kernel, 4, sizeof(int), (const void *)&xySize);
+  clSetKernelArg(kernel, 5, sizeof(int), (const void *)&outChannels);
+
+  size_t localSize = 64;
+  static constexpr int nKernelDims = 2;
+  size_t globalSizes[nKernelDims] = {roundUpToMultiple((size_t)outChannels, localSize), (size_t)batchSize};
+  size_t localSizes[nKernelDims] = {localSize, 1};
+
+  cl_int err;
+  err = clEnqueueNDRangeKernel(
+    commandQueue, kernel, nKernelDims, NULL, globalSizes, localSizes, 0, NULL, eventBuf
+  );
+  return err;
+}
+
 cl_int OpenCLHelpers::doSwiGLU(
   cl_kernel kernel,
   cl_command_queue commandQueue,

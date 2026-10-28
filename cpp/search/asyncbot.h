@@ -18,6 +18,14 @@ class AsyncBot {
     Logger* logger,
     const std::string& randSeed
   );
+  AsyncBot(
+    const SearchParams& params,
+    NNEvaluator* nnEval,
+    NNEvaluator* humanEval,
+    NNEvaluator* auxEval,
+    Logger* logger,
+    const std::string& randSeed
+  );
   ~AsyncBot();
 
   AsyncBot(const AsyncBot& other) = delete;

@@ -88,7 +88,9 @@ NNEvaluator::NNEvaluator(
    logger(lg),
    internalModelName(),
    modelVersion(-1),
+   isLZModelFlag(false),
    inputsVersion(-1),
+   valueFromBlackPerspective(false),
    numInputMetaChannels(0),
    postProcessParams(),
    numServerThreadsEverSpawned(0),
@@ -140,6 +142,31 @@ NNEvaluator::NNEvaluator(
     const ModelDesc& desc = NeuralNet::getModelDesc(loadedModel);
     internalModelName = desc.name;
     modelVersion = desc.modelVersion;
+    isLZModelFlag = desc.isLZModel;
+    //Leela Zero-style networks have their spatial size fixed at 19x19.
+    if(isLZModelFlag && (nnXLen != NNPos::MAX_BOARD_LEN || nnYLen != NNPos::MAX_BOARD_LEN))
+      throw StringError(
+        "Leela Zero model requires a " +
+        Global::intToString(NNPos::MAX_BOARD_LEN) + " x " + Global::intToString(NNPos::MAX_BOARD_LEN) +
+        " neural net buffer, but the configured buffer is " +
+        Global::intToString(nnXLen) + " x " + Global::intToString(nnYLen));
+    //LZ nets use the V8 input layout: 19 spatial planes (an on-board mask plus the 18 LZ
+    //history/color planes) and a single dummy global channel, with no meta encoder. Assert it here
+    //so that a model claiming to be LZ but carrying some other layout fails loudly instead of
+    //being silently featurized the wrong way.
+    if(isLZModelFlag) {
+      if(desc.numInputChannels != NNInputs::NUM_FEATURES_SPATIAL_V8 ||
+         desc.numInputGlobalChannels != NNInputs::NUM_FEATURES_GLOBAL_V8 ||
+         desc.metaEncoderVersion != 0)
+        throw StringError(
+          "Leela Zero model has an unexpected input layout: " +
+          Global::intToString(desc.numInputChannels) + " spatial channels (expected " +
+          Global::intToString(NNInputs::NUM_FEATURES_SPATIAL_V8) + "), " +
+          Global::intToString(desc.numInputGlobalChannels) + " global channels (expected " +
+          Global::intToString(NNInputs::NUM_FEATURES_GLOBAL_V8) + "), metaEncoderVersion " +
+          Global::intToString(desc.metaEncoderVersion) + " (expected 0)");
+    }
+    valueFromBlackPerspective = desc.valueFromBlackPerspective;
     inputsVersion = NNModelVersion::getInputsVersion(modelVersion);
     numInputMetaChannels = desc.numInputMetaChannels;
     computeContext = NeuralNet::createComputeContext(
@@ -155,6 +182,7 @@ NNEvaluator::NNEvaluator(
   else {
     internalModelName = "random";
     modelVersion = NNModelVersion::defaultModelVersion;
+    isLZModelFlag = false;
     inputsVersion = NNModelVersion::getInputsVersion(modelVersion);
   }
 
@@ -288,6 +316,9 @@ bool NNEvaluator::getRequireExactNNLen() const {
 int NNEvaluator::getModelVersion() const {
   return modelVersion;
 }
+bool NNEvaluator::isLZModel() const {
+  return isLZModelFlag;
+}
 double NNEvaluator::getTrunkSpatialConvDepth() const {
   return NeuralNet::getModelDesc(loadedModel).getTrunkSpatialConvDepth();
 }
@@ -309,6 +340,11 @@ enabled_t NNEvaluator::getUsingFP16Mode() const {
 }
 
 bool NNEvaluator::supportsShorttermError() const {
+  //Leela-Zero-style nets have no shortterm error outputs. Keyed on the explicit LZ marker rather
+  //than on a version bound, so that a future upstream version raising the bound does not silently
+  //change what an LZ net is taken to support.
+  if(isLZModelFlag)
+    return false;
   return modelVersion >= 9;
 }
 
@@ -487,7 +523,7 @@ void NNEvaluator::fillRowBufs(
   if(buf.rowMetaBuf.size() < rowMetaLen)
     buf.rowMetaBuf.resize(rowMetaLen);
 
-  static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
+  static_assert(NNModelVersion::latestInputsVersionImplemented == 8, "");
   if(inputsVersion == 3)
     NNInputs::fillRowV3(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
   else if(inputsVersion == 4)
@@ -498,6 +534,8 @@ void NNEvaluator::fillRowBufs(
     NNInputs::fillRowV6(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
   else if(inputsVersion == 7)
     NNInputs::fillRowV7(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
+  else if(inputsVersion == 8)
+    NNInputs::fillRowV8(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
   else
     ASSERT_UNREACHABLE;
 
@@ -1072,6 +1110,217 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
   return new std::shared_ptr<NNOutput>(new NNOutput(ptrs));
 }
 
+//-------------------------------------------------------------------------------------
+//LZ0 ladder correction: Leela Zero-style inputs (V8) have no ladder feature planes, so the policy
+//head is blind to ladders. Patch the policy in place with KataGo's rule-based bounded ladder solver:
+//boost capture moves against opponent groups proven capturable, and demote our own moves that leave
+//an adjacent friendly group in an inescapable capture or that atari a group that simply runs away.
+//Only used for LZ models; native KataGo nets are unaffected.
+
+static constexpr float LZ_LADDER_BOOST_FACTOR = 2.0f;
+static constexpr int LZ_LADDER_CANDIDATE_LIMIT = 10;
+static constexpr float LZ_LADDER_MIN_CANDIDATE_PRIOR = 5e-4f;
+
+//Runs on the raw policy logits, before the legality filter and softmax. Because the values are
+//logits rather than probabilities, "demote" means subtracting a large-enough constant that the
+//move's probability becomes negligible while staying finite, and "boost" means adding a constant
+//that lifts the move near the top of the distribution. The subsequent softmax renormalizes, so
+//the output always sums to 1.
+//
+//Coordinate note: fillRowV8 writes the LZ-style planes bottom-origin, but this function works in
+//KataGo's board coordinates via NNPos::posToLoc / locToPos, which are top-origin. The pos<->loc
+//mapping is therefore self-consistent here (both directions go through the same helpers), and no
+//extra flip is needed.
+static constexpr float LZ_LADDER_DEMOTE_LOGIT = 30.0f;
+
+static void applyLZLadderLogitCorrection(
+  const Board& board,
+  const BoardHistory& history,
+  Player nextPlayer,
+  int nnXLen,
+  int nnYLen,
+  float* policy,
+  const bool* isLegal
+) {
+  const int policySize = NNPos::getPolicySize(nnXLen,nnYLen);
+
+  float maxLogit = -1e25f;
+  for(int pos = 0; pos<policySize; pos++) {
+    if(!isLegal[pos])
+      continue;
+    if(policy[pos] > maxLogit)
+      maxLogit = policy[pos];
+  }
+  if(maxLogit <= -1e24f)
+    return;
+
+  const bool suicideLegal = history.rules.multiStoneSuicideLegal;
+
+  static const int NDX[4] = {1,-1,0,0};
+  static const int NDY[4] = {0,0,1,-1};
+  vector<Loc> buf;
+
+  //(a) Boost moves that start a winning ladder, in the manner of LZ's LadderDetection: playing
+  //the move must capture nothing, leave the target group in atari, and that group must remain
+  //ladder-doomed even with the defender moving first (LZ's IsLadderEscape < 0). The raw solver
+  //proof ("this two-liberty group can be captured") also covers ordinary short-range tactics
+  //where the defender escapes by extending; boosting those fires all over complex positions and
+  //scrambles the midgame policy, so each working move is verified on the board before boosting.
+  NNInputs::iterateLadderGroups(board, [&](Loc loc, int libs, bool captured, const vector<Loc>& workingMoves) {
+    if(!captured || libs != 2)
+      return;
+    Color stone = board.colors[loc];
+    if(stone == C_EMPTY || stone == nextPlayer)
+      return;
+    const float boostTo = maxLogit + std::log(LZ_LADDER_BOOST_FACTOR);
+    for(Loc m: workingMoves) {
+      if(!board.isLegal(m,nextPlayer,suicideLegal))
+        continue;
+      int pos = NNPos::locToPos(m,board.x_size,nnXLen,nnYLen);
+      if(pos < 0 || pos >= policySize)
+        continue;
+      if(!isLegal[pos])
+        continue;
+      Board copy(board);
+      if(!copy.playMove(m,nextPlayer,suicideLegal))
+        continue;
+      //LZ requires the move to capture nothing (capture_count == 0).
+      if(nextPlayer == P_WHITE
+         ? copy.numWhiteCaptures != board.numWhiteCaptures
+         : copy.numBlackCaptures != board.numBlackCaptures)
+        continue;
+      //Kos make the ladder verdict unreliable (the recapture might be illegal), so skip them.
+      if(copy.ko_loc != Board::NULL_LOC)
+        continue;
+      //The target group must now be in atari, and remain ladder-doomed with the defender to move.
+      bool ladderDoomed = false;
+      const int mx = Location::getX(m,board.x_size);
+      const int my = Location::getY(m,board.x_size);
+      for(int d = 0; d<4 && !ladderDoomed; d++) {
+        const int nx = mx + NDX[d];
+        const int ny = my + NDY[d];
+        if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
+          continue;
+        Loc nb = Location::getLoc(nx,ny,board.x_size);
+        if(copy.colors[nb] != stone)
+          continue;
+        if(copy.getNumLiberties(nb) != 1)
+          continue;
+        if(copy.searchIsLadderCaptured(nb,true,buf))
+          ladderDoomed = true;
+      }
+      if(!ladderDoomed)
+        continue;
+      if(boostTo > policy[pos])
+        policy[pos] = boostTo;
+    }
+  });
+
+  //(b) Check the most promising own moves for ladder safety and for failed chases.
+  vector<pair<float,int>> candidates;
+  candidates.reserve(policySize);
+  for(int pos = 0; pos<policySize; pos++) {
+    if(!isLegal[pos])
+      continue;
+    if(NNPos::isPassPos(pos,nnXLen,nnYLen))
+      continue;
+    candidates.push_back(make_pair(policy[pos],pos));
+  }
+  if(candidates.empty())
+    return;
+
+  int numCandidates = std::min((int)candidates.size(), LZ_LADDER_CANDIDATE_LIMIT);
+  std::partial_sort(
+    candidates.begin(), candidates.begin() + numCandidates, candidates.end(),
+    [](const pair<float,int>& a, const pair<float,int>& b) { return a.first > b.first; }
+  );
+
+  for(int i = 0; i<numCandidates; i++) {
+    const float logit = candidates[i].first;
+    //Candidate priors were tuned for probabilities; compare in log space against the same
+    //threshold so the shortlist is unchanged.
+    if(logit < maxLogit + std::log(LZ_LADDER_MIN_CANDIDATE_PRIOR))
+      break;
+    const int pos = candidates[i].second;
+    Loc moveLoc = NNPos::posToLoc(pos,board.x_size,board.y_size,nnXLen,nnYLen);
+    if(moveLoc == Board::NULL_LOC || moveLoc == Board::PASS_LOC)
+      continue;
+
+    const int x = Location::getX(moveLoc,board.x_size);
+    const int y = Location::getY(moveLoc,board.x_size);
+    //Cheap precheck: only moves that touch a group with at most two liberties can change a
+    //ladder verdict, so skip the copy and search for everything else.
+    bool nearAtari = false;
+    for(int d = 0; d<4; d++) {
+      const int nx = x + NDX[d];
+      const int ny = y + NDY[d];
+      if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
+        continue;
+      Loc nb = Location::getLoc(nx,ny,board.x_size);
+      Color c0 = board.colors[nb];
+      if(c0 == C_EMPTY)
+        continue;
+      const int libs0 = board.getNumLiberties(nb);
+      if(libs0 <= 2)
+        nearAtari = true;
+    }
+    if(!nearAtari)
+      continue;
+
+    Board copy(board);
+    if(!copy.playMove(moveLoc,nextPlayer,suicideLegal))
+      continue;
+    //Kos make the ladder verdict unreliable (the recapture might be illegal), so skip them.
+    if(copy.ko_loc != Board::NULL_LOC)
+      continue;
+
+    bool defenseFail = false;
+
+    Loc checkedHeads[4];
+    int numChecked = 0;
+    for(int d = 0; d<4; d++) {
+      const int nx = x + NDX[d];
+      const int ny = y + NDY[d];
+      if(nx < 0 || nx >= board.x_size || ny < 0 || ny >= board.y_size)
+        continue;
+      Loc nb = Location::getLoc(nx,ny,board.x_size);
+      Color col = copy.colors[nb];
+      if(col == C_EMPTY)
+        continue;
+      Loc head = copy.chain_head[nb];
+      bool seen = false;
+      for(int j = 0; j<numChecked; j++) {
+        if(checkedHeads[j] == head) { seen = true; break; }
+      }
+      if(seen)
+        continue;
+      if(numChecked < 4)
+        checkedHeads[numChecked++] = head;
+
+      const int postLibs = copy.getNumLiberties(nb);
+      if(postLibs > 2)
+        continue;
+      if(col == nextPlayer) {
+        //Our own group would still be captured with the opponent moving first. LZ gates this on
+        //the group having exactly two liberties and being larger than what the move captures
+        //(stone_count > capture_count); KataGo's solver returns only a verdict, so mirror the
+        //liberty count and stone-count side of the test to avoid demoting on shallow ataris.
+        if(postLibs == 2 && copy.getChainSize(nb) > 1) {
+          if(copy.searchIsLadderCaptured(nb,false,buf))
+            defenseFail = true;
+        }
+      }
+      //No chase-fail demotion: LZ only penalizes chases proven futile at depth >= 8 plies
+      //(IsLadderChase >= cfg_ladder_offense), which the boolean KataGo solver cannot measure.
+      //Demoting every atari of an escaping group fires on ordinary sente ataris all over
+      //complex positions and scrambles the midgame policy.
+    }
+
+    if(defenseFail)
+      policy[pos] -= LZ_LADDER_DEMOTE_LOGIT;
+  }
+}
+
 void NNEvaluator::evaluate(
   const Board& board,
   const BoardHistory& history,
@@ -1234,6 +1483,19 @@ void NNEvaluator::evaluate(
     }
 
     testAssert(legalCount > 0);
+
+    //LZ0 ladder-blindness correction. Applied to the scaled logits, before the softmax, so the
+    //legality mask is already in place and the renormalization that follows keeps the output a
+    //valid distribution. Native KataGo nets are unaffected.
+    if(isLZModelFlag)
+      applyLZLadderLogitCorrection(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal);
+
+    //The correction can change which logit is the largest, so recompute the softmax reference.
+    maxPolicy = -1e25f;
+    for(int i = 0; i<policySize; i++) {
+      if(policy[i] > maxPolicy)
+        maxPolicy = policy[i];
+    }
 
     float policySum = 0.0f;
 
@@ -1432,7 +1694,28 @@ void NNEvaluator::evaluate(
         }
       }
 
-      if(nextPlayer == P_WHITE) {
+      //Leela Zero-style networks have no score, variance, or shortterm error outputs (their
+      //score head is a dummy). Neutralize those fields: the score is unknown, so report a draw
+      //with zero variance, and mark the uncertainty fields as unsupported (-1).
+      if(isLZModelFlag) {
+        scoreMean = 0.0;
+        scoreMeanSq = 0.0;
+        lead = 0.0;
+        varTimeLeft = -1.0;
+        shorttermWinlossError = -1.0;
+        shorttermScoreError = -1.0;
+      }
+
+      //The neural net's (win,loss,draw) triple is from the perspective of the player to move by
+      //default. Model version 18 nets may instead report it from black's perspective
+      //(valueFromBlackPerspective, e.g. Leela Zero v2/ELF nets, whose raw output is the
+      //black win probability regardless of whose turn it is).
+      //  - player-to-move perspective: whiteWinProb = P(white wins) = (nextPlayer == P_WHITE)
+      //    ? winProb : lossProb, i.e. swap exactly when black is to move.
+      //  - black perspective: whiteWinProb = P(white wins) = lossProb unconditionally, i.e.
+      //    always swap.
+      bool swapWinLoss = valueFromBlackPerspective ? true : (nextPlayer != P_WHITE);
+      if(!swapWinLoss) {
         buf.result->whiteWinProb = (float)winProb;
         buf.result->whiteLossProb = (float)lossProb;
         buf.result->whiteNoResultProb = (float)noResultProb;
@@ -1487,7 +1770,6 @@ void NNEvaluator::evaluate(
       throw StringError("NNEval value postprocessing not implemented for model version");
     }
   }
-
 
   // And record the nnHash in the result and put it into the table
   buf.result->nnHash = nnHash;

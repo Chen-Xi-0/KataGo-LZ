@@ -15,7 +15,10 @@ NodeStatsAtomic::NodeStatsAtomic()
    utilityAvg(0.0),
    utilitySqAvg(0.0),
    weightSum(0.0),
-   weightSqSum(0.0)
+   weightSqSum(0.0),
+   auxScoreMeanAvg(0.0),
+   auxScoreMeanSqAvg(0.0),
+   auxLeadAvg(0.0)
 {}
 NodeStatsAtomic::NodeStatsAtomic(const NodeStatsAtomic& other)
   :visits(other.visits.load(std::memory_order_acquire)),
@@ -27,7 +30,10 @@ NodeStatsAtomic::NodeStatsAtomic(const NodeStatsAtomic& other)
    utilityAvg(other.utilityAvg.load(std::memory_order_acquire)),
    utilitySqAvg(other.utilitySqAvg.load(std::memory_order_acquire)),
    weightSum(other.weightSum.load(std::memory_order_acquire)),
-   weightSqSum(other.weightSqSum.load(std::memory_order_acquire))
+   weightSqSum(other.weightSqSum.load(std::memory_order_acquire)),
+   auxScoreMeanAvg(other.auxScoreMeanAvg.load(std::memory_order_acquire)),
+   auxScoreMeanSqAvg(other.auxScoreMeanSqAvg.load(std::memory_order_acquire)),
+   auxLeadAvg(other.auxLeadAvg.load(std::memory_order_acquire))
 {}
 NodeStatsAtomic::~NodeStatsAtomic()
 {}
@@ -42,7 +48,10 @@ NodeStats::NodeStats()
    utilityAvg(0.0),
    utilitySqAvg(0.0),
    weightSum(0.0),
-   weightSqSum(0.0)
+   weightSqSum(0.0),
+   auxScoreMeanAvg(0.0),
+   auxScoreMeanSqAvg(0.0),
+   auxLeadAvg(0.0)
 {}
 NodeStats::NodeStats(const NodeStatsAtomic& other)
   :visits(other.visits.load(std::memory_order_acquire)),
@@ -54,7 +63,10 @@ NodeStats::NodeStats(const NodeStatsAtomic& other)
    utilityAvg(other.utilityAvg.load(std::memory_order_acquire)),
    utilitySqAvg(other.utilitySqAvg.load(std::memory_order_acquire)),
    weightSum(other.weightSum.load(std::memory_order_acquire)),
-   weightSqSum(other.weightSqSum.load(std::memory_order_acquire))
+   weightSqSum(other.weightSqSum.load(std::memory_order_acquire)),
+   auxScoreMeanAvg(other.auxScoreMeanAvg.load(std::memory_order_acquire)),
+   auxScoreMeanSqAvg(other.auxScoreMeanSqAvg.load(std::memory_order_acquire)),
+   auxLeadAvg(other.auxLeadAvg.load(std::memory_order_acquire))
 {}
 NodeStats::~NodeStats()
 {}
@@ -127,6 +139,7 @@ SearchNode::SearchNode(Player pla, bool fnt, uint32_t mIdx, Hash128 gh)
    state(SearchNode::STATE_UNEVALUATED),
    nnOutput(),
    humanOutput(),
+   auxOutput(),
    nodeAge(0),
    children0(NULL),
    children1(NULL),
@@ -151,6 +164,7 @@ SearchNode::SearchNode(const SearchNode& other, bool fnt, bool copySubtreeValueB
    state(other.state.load(std::memory_order_acquire)),
    nnOutput(),
    humanOutput(),
+   auxOutput(),
    nodeAge(other.nodeAge.load(std::memory_order_acquire)),
    children0(NULL),
    children1(NULL),
@@ -174,6 +188,11 @@ SearchNode::SearchNode(const SearchNode& other, bool fnt, bool copySubtreeValueB
     std::shared_ptr<NNOutput>* otherVal = other.humanOutput.load(std::memory_order_acquire);
     if(otherVal != NULL)
       humanOutput.store(new std::shared_ptr<NNOutput>(*otherVal), std::memory_order_release);
+  }
+  {
+    std::shared_ptr<NNOutput>* otherVal = other.auxOutput.load(std::memory_order_acquire);
+    if(otherVal != NULL)
+      auxOutput.store(new std::shared_ptr<NNOutput>(*otherVal), std::memory_order_release);
   }
   {
     const VisitCapSnapshot* otherVal = other.visitCapSnapshot.load(std::memory_order_acquire);
@@ -386,6 +405,20 @@ const NNOutput* SearchNode::getHumanOutput() const {
   return nn->get();
 }
 
+NNOutput* SearchNode::getAuxOutput() {
+  std::shared_ptr<NNOutput>* nn = auxOutput.load(std::memory_order_acquire);
+  if(nn == NULL)
+    return NULL;
+  return nn->get();
+}
+
+const NNOutput* SearchNode::getAuxOutput() const {
+  const std::shared_ptr<NNOutput>* nn = auxOutput.load(std::memory_order_acquire);
+  if(nn == NULL)
+    return NULL;
+  return nn->get();
+}
+
 
 bool SearchNode::storeNNOutput(std::shared_ptr<NNOutput>* newNNOutput, SearchThread& thread) {
   std::shared_ptr<NNOutput>* toCleanUp = nnOutput.exchange(newNNOutput, std::memory_order_acq_rel);
@@ -416,6 +449,20 @@ bool SearchNode::storeHumanOutputIfNull(std::shared_ptr<NNOutput>* newHumanOutpu
   return humanOutput.compare_exchange_strong(expected, newHumanOutput, std::memory_order_acq_rel);
 }
 
+bool SearchNode::storeAuxOutput(std::shared_ptr<NNOutput>* newAuxOutput, SearchThread& thread) {
+  std::shared_ptr<NNOutput>* toCleanUp = auxOutput.exchange(newAuxOutput, std::memory_order_acq_rel);
+  if(toCleanUp != NULL) {
+    thread.oldNNOutputsToCleanUp.push_back(toCleanUp);
+    return false;
+  }
+  return true;
+}
+
+bool SearchNode::storeAuxOutputIfNull(std::shared_ptr<NNOutput>* newAuxOutput) {
+  std::shared_ptr<NNOutput>* expected = NULL;
+  return auxOutput.compare_exchange_strong(expected, newAuxOutput, std::memory_order_acq_rel);
+}
+
 
 SearchNode::~SearchNode() {
   // Do NOT recursively delete children
@@ -430,6 +477,8 @@ SearchNode::~SearchNode() {
     delete nnOutput;
   if(humanOutput != NULL)
     delete humanOutput;
+  if(auxOutput != NULL)
+    delete auxOutput;
   if(visitCapSnapshot != NULL)
     delete visitCapSnapshot;
 }

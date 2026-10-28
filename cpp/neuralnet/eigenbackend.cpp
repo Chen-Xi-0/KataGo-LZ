@@ -1,4 +1,4 @@
-#ifdef USE_EIGEN_BACKEND
+﻿#ifdef USE_EIGEN_BACKEND
 
 /** Eigen3 backend.
  *
@@ -1115,7 +1115,9 @@ struct ResidualBlock final : public ResidualBlockIntf {
     : name(desc.name),
       normActConv1(desc.preBN,desc.preActivation,desc.regularConv,nnX,nnY),
       normActConv2(desc.midBN,desc.midActivation,desc.finalConv,nnX,nnY)
-  {}
+  {
+    testAssert(!desc.hasPostNorm);
+  }
 
   size_t requiredConvWorkspaceElts(size_t maxBatchSize) const override {
     return std::max(
@@ -1142,6 +1144,63 @@ struct ResidualBlock final : public ResidualBlockIntf {
 
     normActConv1.apply(handle, trunk, trunkScratch, &midIn, mask, convWorkspace, false);
     normActConv2.apply(handle, &midIn, &midScratch, trunk, mask, convWorkspace, true);
+  }
+};
+
+// --------------------------------------------------------------------------------------------------------------
+
+//Private extension (model version 18, Leela-Zero weight loading): an ordinary residual block
+//plus a batch norm + activation applied to the trunk flow AFTER the residual accumulation.
+//This reproduces Leela Zero's x_i = ReLU(x_{i-1} + BN_b(conv_b(ReLU(BN_a(conv_a(x_{i-1})))))).
+struct PostNormResidualBlock final : public ResidualBlockIntf {
+  const string name;
+  const NormActConv normActConv1;
+  const NormActConv normActConv2;
+  const BatchNormLayer postBN;
+
+  PostNormResidualBlock() = delete;
+  PostNormResidualBlock(const PostNormResidualBlock&) = delete;
+  PostNormResidualBlock& operator=(const PostNormResidualBlock&) = delete;
+
+  ~PostNormResidualBlock(){}
+
+  PostNormResidualBlock(const ResidualBlockDesc& desc, int nnX, int nnY)
+    : name(desc.name),
+      normActConv1(desc.preBN,desc.preActivation,desc.regularConv,nnX,nnY),
+      normActConv2(desc.midBN,desc.midActivation,desc.finalConv,nnX,nnY),
+      postBN(desc.postBN,desc.postActivation)
+  {
+    testAssert(desc.hasPostNorm);
+  }
+
+  size_t requiredConvWorkspaceElts(size_t maxBatchSize) const override {
+    return std::max(
+      normActConv1.requiredConvWorkspaceElts(maxBatchSize),
+      normActConv2.requiredConvWorkspaceElts(maxBatchSize)
+    );
+  }
+
+  void apply(
+    ComputeHandleInternal* handle,
+    ScratchBuffers* scratch,
+    TENSORMAP4* trunk,
+    TENSORMAP4* trunkScratch,
+    CONSTTENSORMAP3* mask,
+    const float* maskSum,
+    float* convWorkspace
+  ) const override {
+    (void)maskSum;
+    int batchSize = trunk->dimension(3);
+    SizedBuf<float*> midInBuf(scratch->allocator, scratch->getBufSizeXY(normActConv1.outChannels));
+    SizedBuf<float*> midScratchBuf(scratch->allocator, scratch->getBufSizeXY(normActConv1.outChannels));
+    TENSORMAP4 midIn(midInBuf.buf, normActConv1.outChannels, handle->nnXLen, handle->nnYLen, batchSize);
+    TENSORMAP4 midScratch(midScratchBuf.buf, normActConv1.outChannels, handle->nnXLen, handle->nnYLen, batchSize);
+
+    normActConv1.apply(handle, trunk, trunkScratch, &midIn, mask, convWorkspace, false);
+    normActConv2.apply(handle, &midIn, &midScratch, trunk, mask, convWorkspace, true);
+    //Post-residual batch norm + activation on the trunk flow. BatchNormLayer::apply is
+    //strictly elementwise per channel, so applying it in place (input == output) is safe.
+    postBN.apply(trunk, trunk, mask);
   }
 };
 
@@ -1734,6 +1793,11 @@ BlockStack::BlockStack(
       std::unique_ptr<ResidualBlockIntf> block = std::make_unique<ResidualBlock>(*blockDesc,nnX,nnY);
       blocks.emplace_back(ORDINARY_BLOCK_KIND, std::move(block));
     }
+    else if (descBlocks[i].first == POSTNORM_BLOCK_KIND) {
+      ResidualBlockDesc* blockDesc = (ResidualBlockDesc*)descBlocks[i].second.get();
+      std::unique_ptr<ResidualBlockIntf> block = std::make_unique<PostNormResidualBlock>(*blockDesc,nnX,nnY);
+      blocks.emplace_back(POSTNORM_BLOCK_KIND, std::move(block));
+    }
     else if (descBlocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
       GlobalPoolingResidualBlockDesc* blockDesc = (GlobalPoolingResidualBlockDesc*)descBlocks[i].second.get();
       std::unique_ptr<GlobalPoolingResidualBlock> block = std::make_unique<GlobalPoolingResidualBlock>(*blockDesc,nnX,nnY);
@@ -1950,12 +2014,17 @@ struct Trunk {
 struct PolicyHead {
   const string name;
   const int modelVersion;
+  //mv18 and later: if true, use the Leela-Zero-style full policy matmul (pFullMul) instead of
+  //the p2Conv + global pooling pass path.
+  const bool hasFullPolicyMul;
 
   const ConvLayer p1Conv;
   const ConvLayer g1Conv;
   const BatchNormLayer g1BN;
   const MatMulLayer gpoolToBiasMul;
   const BatchNormLayer p1BN;
+  const MatMulLayer pFullMul;
+  const MatBiasLayer pFullMulBias;
   const ConvLayer p2Conv;
   const MatMulLayer gpoolToPassMul;
   const MatBiasLayer gpoolToPassBias;
@@ -1969,17 +2038,33 @@ struct PolicyHead {
   PolicyHead(const PolicyHeadDesc& desc, int nnX, int nnY)
     : name(desc.name),
       modelVersion(desc.modelVersion),
+      hasFullPolicyMul(desc.hasFullPolicyMul),
       p1Conv(desc.p1Conv,nnX,nnY),
       g1Conv(desc.g1Conv,nnX,nnY),
       g1BN(desc.g1BN,desc.g1Activation),
       gpoolToBiasMul(desc.gpoolToBiasMul),
       p1BN(desc.p1BN,desc.p1Activation),
+      pFullMul(desc.pFullMul),
+      pFullMulBias(desc.pFullMulBias),
       p2Conv(desc.p2Conv,nnX,nnY),
       gpoolToPassMul(desc.gpoolToPassMul),
       gpoolToPassBias(desc.gpoolToPassBias),
       passActivation(desc.passActivation),
       gpoolToPassMul2(desc.gpoolToPassMul2)
-  {}
+  {
+    if(hasFullPolicyMul) {
+      //pFullMul consumes the flattened spatial p1Activation output: nnXLen*nnYLen positions each
+      //with p1Conv.outChannels channels, position-major and channel-minor.
+      if(pFullMul.inChannels != p1Conv.outChannels * nnX * nnY)
+        throw StringError(
+          name + Global::strprintf(
+                   ": pFullMul.inChannels (%d) != p1Conv.outChannels (%d) * nnXLen (%d) * nnYLen (%d)",
+                   pFullMul.inChannels,
+                   p1Conv.outChannels,
+                   nnX,
+                   nnY));
+    }
+  }
 
   size_t requiredConvWorkspaceElts(size_t maxBatchSize) const {
     size_t maxElts = 0;
@@ -2016,22 +2101,51 @@ struct PolicyHead {
     TENSORMAP2 p1Pass(p1PassBuf.buf, p1Conv.outChannels, batchSize);
 
     p1Conv.apply(handle, trunk, &p1Out, convWorkspace, false);
-    g1Conv.apply(handle, trunk, &g1Out, convWorkspace, false);
-    g1BN.apply(&g1Out, &g1Out2, mask);
-    poolRowsGPool(&g1Out2, &g1Concat, mask, maskSum);
-    gpoolToBiasMul.apply(&g1Concat, &g1Bias);
-    addNCBiasInplace(&p1Out, &g1Bias);
-    p1BN.apply(&p1Out, &p1Out2, mask);
-    p2Conv.apply(handle, &p1Out2, policy, convWorkspace, false);
 
-    if(modelVersion >= 15) {
-      gpoolToPassMul.apply(&g1Concat, &p1Pass);
-      gpoolToPassBias.apply(&p1Pass);
-      passActivation.apply(&p1Pass, &p1Pass);
-      gpoolToPassMul2.apply(&p1Pass, policyPass);
+    if(hasFullPolicyMul) {
+      //Leela-Zero-style policy head: p1Conv -> p1BN(+ReLU) -> flatten -> pFullMul -> pFullMulBias,
+      //then split into per-position logits and the pass logit(s).
+      p1BN.apply(&p1Out, &p1Out2, mask);
+      const int numSpatial = handle->nnXLen * handle->nnYLen;
+      //p1Out2 is a (C,X,Y,N) column-major tensor, i.e. NHWC in linear memory, so each batch's
+      //contiguous block of C*X*Y values is already the position-major, channel-minor flattening
+      //that pFullMul expects: input index = (y*nnXLen + x)*C + c.
+      TENSORMAP2 p1Flat(p1Out2Buf.buf, numSpatial * p1Conv.outChannels, batchSize);
+      SizedBuf<float*> p1FullBuf(scratch->allocator, scratch->getBufSize(pFullMul.outChannels));
+      TENSORMAP2 p1Full(p1FullBuf.buf, pFullMul.outChannels, batchSize);
+      pFullMul.apply(&p1Flat, &p1Full);
+      pFullMulBias.apply(&p1Full);
+      const int poc = policy->dimension(0);
+      for(int n = 0; n < batchSize; n++) {
+        const float* fullCol = p1FullBuf.buf + (size_t)n * pFullMul.outChannels;
+        for(int c = 0; c < poc; c++) {
+          for(int y = 0; y < handle->nnYLen; y++) {
+            for(int x = 0; x < handle->nnXLen; x++) {
+              (*policy)(c, x, y, n) = fullCol[((size_t)y * handle->nnXLen + x) * poc + c];
+            }
+          }
+          (*policyPass)(c, n) = fullCol[(size_t)numSpatial * poc + c];
+        }
+      }
     }
     else {
-      gpoolToPassMul.apply(&g1Concat, policyPass);
+      g1Conv.apply(handle, trunk, &g1Out, convWorkspace, false);
+      g1BN.apply(&g1Out, &g1Out2, mask);
+      poolRowsGPool(&g1Out2, &g1Concat, mask, maskSum);
+      gpoolToBiasMul.apply(&g1Concat, &g1Bias);
+      addNCBiasInplace(&p1Out, &g1Bias);
+      p1BN.apply(&p1Out, &p1Out2, mask);
+      p2Conv.apply(handle, &p1Out2, policy, convWorkspace, false);
+
+      if(modelVersion >= 15) {
+        gpoolToPassMul.apply(&g1Concat, &p1Pass);
+        gpoolToPassBias.apply(&p1Pass);
+        passActivation.apply(&p1Pass, &p1Pass);
+        gpoolToPassMul2.apply(&p1Pass, policyPass);
+      }
+      else {
+        gpoolToPassMul.apply(&g1Concat, policyPass);
+      }
     }
   }
 };
@@ -2039,6 +2153,9 @@ struct PolicyHead {
 struct ValueHead {
   const string name;
   const int modelVersion;
+  //mv18 and later: if true, v2Mul consumes the flattened spatial v1Activation output directly
+  //instead of the 3 global pooling statistics (Leela-Zero-style value head).
+  const bool hasFullValueMul;
 
   const ConvLayer v1Conv;
   const BatchNormLayer v1BN;
@@ -2058,6 +2175,7 @@ struct ValueHead {
   ValueHead(const ValueHeadDesc& desc, int nnX, int nnY)
     : name(desc.name),
       modelVersion(desc.modelVersion),
+      hasFullValueMul(desc.hasFullValueMul),
       v1Conv(desc.v1Conv,nnX,nnY),
       v1BN(desc.v1BN,desc.v1Activation),
       v2Mul(desc.v2Mul),
@@ -2067,7 +2185,21 @@ struct ValueHead {
       v3Bias(desc.v3Bias),
       sv3Mul(desc.sv3Mul),
       sv3Bias(desc.sv3Bias),
-      vOwnershipConv(desc.vOwnershipConv,nnX,nnY) {}
+      vOwnershipConv(desc.vOwnershipConv,nnX,nnY)
+  {
+    if(hasFullValueMul) {
+      //v2Mul consumes the flattened spatial v1Activation output: nnXLen*nnYLen positions each
+      //with v1Conv.outChannels channels, position-major and channel-minor.
+      if(v2Mul.inChannels != v1Conv.outChannels * nnX * nnY)
+        throw StringError(
+          name + Global::strprintf(
+                   ": v2Mul.inChannels (%d) != v1Conv.outChannels (%d) * nnXLen (%d) * nnYLen (%d)",
+                   v2Mul.inChannels,
+                   v1Conv.outChannels,
+                   nnX,
+                   nnY));
+    }
+  }
 
   size_t requiredConvWorkspaceElts(size_t maxBatchSize) const {
     size_t maxElts = 0;
@@ -2100,8 +2232,19 @@ struct ValueHead {
 
     v1Conv.apply(handle, trunk, &v1Out, convWorkspace, false);
     v1BN.apply(&v1Out, &v1Out2, mask);
-    poolRowsValueHead(&v1Out2, &v1Mean, maskSum);
-    v2Mul.apply(&v1Mean, &v2Out);
+    if(hasFullValueMul) {
+      //Leela-Zero-style value head: flatten v1Out2 and feed it directly to v2Mul, skipping the
+      //global pooling statistics. v1Out2 is a (C,X,Y,N) column-major tensor, i.e. NHWC in linear
+      //memory, so each batch's contiguous block of C*X*Y values is already the position-major,
+      //channel-minor flattening that v2Mul expects: input index = (y*nnXLen + x)*C + c.
+      const int numSpatial = handle->nnXLen * handle->nnYLen;
+      TENSORMAP2 v1Flat(v1Out2Buf.buf, numSpatial * v1Conv.outChannels, batchSize);
+      v2Mul.apply(&v1Flat, &v2Out);
+    }
+    else {
+      poolRowsValueHead(&v1Out2, &v1Mean, maskSum);
+      v2Mul.apply(&v1Mean, &v2Out);
+    }
     v2Bias.apply(&v2Out);
     v2Activation.apply(&v2Out, &v2Out);
     v3Mul.apply(&v2Out, value);

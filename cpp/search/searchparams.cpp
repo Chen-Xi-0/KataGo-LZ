@@ -80,6 +80,11 @@ SearchParams::SearchParams()
    avoidRepeatedPatternUtility(0.0),
    nnPolicyTemperature(1.0f),
    antiMirror(false),
+   useDynamicKomi(false),
+   dynamicKomiMaxWr(0.5f),
+   dynamicKomiMinWr(0.1f),
+   dynamicKomiMidWr(0.4f),
+   dynamicKomiTargetKomi(7.5f),
    ignorePreRootHistory(false),
    ignoreAllHistory(false),
    subtreeValueBiasFactor(0.0),
@@ -216,6 +221,12 @@ bool SearchParams::operator==(const SearchParams& other) const {
 
     nnPolicyTemperature == other.nnPolicyTemperature &&
     antiMirror == other.antiMirror &&
+
+    useDynamicKomi == other.useDynamicKomi &&
+    dynamicKomiMaxWr == other.dynamicKomiMaxWr &&
+    dynamicKomiMinWr == other.dynamicKomiMinWr &&
+    dynamicKomiMidWr == other.dynamicKomiMidWr &&
+    dynamicKomiTargetKomi == other.dynamicKomiTargetKomi &&
 
     ignorePreRootHistory == other.ignorePreRootHistory &&
     ignoreAllHistory == other.ignoreAllHistory &&
@@ -480,6 +491,12 @@ json SearchParams::changeableParametersToJson() const {
   // Special handling in GTP
   // ret["antiMirror"] = antiMirror;
 
+  ret["useDynamicKomi"] = useDynamicKomi;
+  ret["dynamicKomiMaxWr"] = dynamicKomiMaxWr;
+  ret["dynamicKomiMinWr"] = dynamicKomiMinWr;
+  ret["dynamicKomiMidWr"] = dynamicKomiMidWr;
+  ret["dynamicKomiTargetKomi"] = dynamicKomiTargetKomi;
+
   ret["ignorePreRootHistory"] = ignorePreRootHistory;
   ret["ignoreAllHistory"] = ignoreAllHistory;
 
@@ -664,6 +681,12 @@ void SearchParams::printParams(std::ostream& out) const {
 
   PRINTPARAM(nnPolicyTemperature);
   PRINTPARAM(antiMirror);
+
+  PRINTPARAM(useDynamicKomi);
+  PRINTPARAM(dynamicKomiMaxWr);
+  PRINTPARAM(dynamicKomiMinWr);
+  PRINTPARAM(dynamicKomiMidWr);
+  PRINTPARAM(dynamicKomiTargetKomi);
 
   PRINTPARAM(ignorePreRootHistory);
   PRINTPARAM(ignoreAllHistory);

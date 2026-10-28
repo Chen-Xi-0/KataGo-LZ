@@ -144,6 +144,9 @@ struct Search {
   bool alwaysIncludeOwnerMap;
 
   SearchParams searchParams;
+  //Virtual komi currently folded into the LZ-compatible net inputs when dynamic komi is enabled.
+  float currentDynamicKomi;
+  bool dynamicKomiSet;
   int64_t numSearchesBegun;
   uint32_t searchNodeAge;
   Player plaThatSearchIsFor;
@@ -183,6 +186,8 @@ struct Search {
   Logger* logger;
   NNEvaluator* nnEvaluator;
   NNEvaluator* humanEvaluator;
+  //Auxiliary evaluator used only to provide score and ownership for reporting. Null if not configured.
+  NNEvaluator* auxEvaluator;
   int nnXLen;
   int nnYLen;
   int policySize;
@@ -225,6 +230,16 @@ struct Search {
     const SearchParams& params,
     NNEvaluator* nnEval,
     NNEvaluator* humanEval,
+    Logger* logger,
+    const std::string& randSeed
+  );
+  //If auxEval is non-null, it is evaluated at every node only to provide score and ownership for reporting.
+  //It never contributes to search values or move selection.
+  Search(
+    const SearchParams& params,
+    NNEvaluator* nnEval,
+    NNEvaluator* humanEval,
+    NNEvaluator* auxEval,
     Logger* logger,
     const std::string& randSeed
   );
@@ -578,6 +593,8 @@ private:
   // searchnnhelpers.cpp
   //----------------------------------------------------------------------------------------
   void computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwnerMap);
+  //Updates currentDynamicKomi from the root position (LZ dynamic komi). Returns true if it changed.
+  bool updateDynamicKomi();
   bool initNodeNNOutput(
     SearchThread& thread, SearchNode& node,
     bool isRoot, bool skipCache, bool isReInit

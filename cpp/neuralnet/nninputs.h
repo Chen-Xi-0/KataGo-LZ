@@ -1,6 +1,7 @@
 #ifndef NEURALNET_NNINPUTS_H_
 #define NEURALNET_NNINPUTS_H_
 
+#include <functional>
 #include <memory>
 
 #include "../core/global.h"
@@ -65,6 +66,11 @@ struct MiscNNInputParams {
   int passAliveSuicideRulesOverride = -1;
   // Same, but for hist.modes.excludeTerritoryAdjacentToAtari.
   int excludeTerritoryAdjAtariOverride = -1;
+  //Dynamic komi for LZ-compatible inputs (model version 18): when enabled, the two color planes
+  //are filled with 0.5 +- dynamicKomi/15 instead of 1/0, encoding a virtual komi into the net input.
+  //This only affects fillRowV8; other input versions ignore it. dynamicKomi is in points (e.g. 7.5).
+  bool useDynamicKomi = false;
+  float dynamicKomi = 0.0f;
 
   // The effective value of modes.alwaysComputePassAliveUnderSuicideRules for featurization: the
   // override if one is set, else hist's own flag.
@@ -86,6 +92,7 @@ struct MiscNNInputParams {
   static const Hash128 ZOBRIST_AVOID_MYTDAGGER_HACK;
   static const Hash128 ZOBRIST_POLICY_OPTIMISM;
   static const Hash128 ZOBRIST_ZERO_HISTORY;
+  static const Hash128 ZOBRIST_DYNAMIC_KOMI;
 };
 
 namespace NNInputs {
@@ -103,6 +110,16 @@ namespace NNInputs {
 
   const int NUM_FEATURES_SPATIAL_V7 = 22;
   const int NUM_FEATURES_GLOBAL_V7 = 19;
+
+  //V8 - LZ-compatible inputs (model version 18), 19x19 only:
+  //  channel 0  = on-board all-ones plane (also serves as the backend mask)
+  //  channels 1-8  = current player's stones, history h=0 (most recent) .. 7
+  //  channels 9-16 = opponent's stones, history h=0 .. 7
+  //  channel 17 = all ones if black to move, else zeros (LZ color plane 16)
+  //  channel 18 = all ones if white to move, else zeros (LZ color plane 17)
+  //Missing history (fewer than 8 moves played) is zero-filled, matching LZ's gather_features.
+  const int NUM_FEATURES_SPATIAL_V8 = 19;
+  const int NUM_FEATURES_GLOBAL_V8 = 1;
 
   Hash128 getHash(
     const Board& board, const BoardHistory& boardHistory, Player nextPlayer,
@@ -129,6 +146,10 @@ namespace NNInputs {
     const Board& board, const BoardHistory& boardHistory, Player nextPlayer,
     const MiscNNInputParams& nnInputParams, int nnXLen, int nnYLen, bool useNHWC, float* rowBin, float* rowGlobal
   );
+  void fillRowV8(
+    const Board& board, const BoardHistory& boardHistory, Player nextPlayer,
+    const MiscNNInputParams& nnInputParams, int nnXLen, int nnYLen, bool useNHWC, float* rowBin, float* rowGlobal
+  );
 
   //If groupTax is specified, for each color region of area, reduce weight on empty spaces equally to reduce the total sum by 2.
   //(but should handle seki correctly)
@@ -137,6 +158,21 @@ namespace NNInputs {
     const Color* area,
     bool groupTax,
     float* scoring
+  );
+
+  //Diagnostic: invoke f once for each group that is in an inescapable atari, or that can be put
+  //into one, with the working moves that would capture it. Runs the same bounded ladder search
+  //that fills the V3+ ladder input planes.
+  void iterateLadders(const Board& board, const std::function<void(Loc,const std::vector<Loc>&)>& f);
+
+  //Invoke f once per group (deduplicated by chain head, both colors) that has 1 or 2 liberties,
+  //reporting the current liberty count and whether the bounded ladder search considers it captured.
+  //For libs == 2, workingMoves holds the attacker moves that work (the defender is the group owner,
+  //so if the group belongs to the side to move these are the moves that would kill it after the
+  //opponent's first move). For libs == 1 workingMoves is empty; the sole liberty is the capture point.
+  void iterateLadderGroups(
+    const Board& board,
+    const std::function<void(Loc,int,bool,const std::vector<Loc>&)>& f
   );
 }
 
