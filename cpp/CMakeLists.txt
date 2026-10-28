@@ -1033,6 +1033,7 @@ add_executable(katago
   neuralnet/desc.cpp
   neuralnet/lzconverter.cpp
   neuralnet/lzladder.cpp
+  neuralnet/lzinputs.cpp
   neuralnet/debugprint.cpp
   ${NEURALNET_BACKEND_SOURCES}
   book/book.cpp
