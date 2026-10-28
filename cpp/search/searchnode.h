@@ -25,6 +25,10 @@ struct NodeStatsAtomic {
   std::atomic<double> utilitySqAvg;
   std::atomic<double> weightSum;
   std::atomic<double> weightSqSum;
+  //Auxiliary evaluator score aggregation, for reporting only. Never used by search.
+  std::atomic<double> auxScoreMeanAvg;
+  std::atomic<double> auxScoreMeanSqAvg;
+  std::atomic<double> auxLeadAvg;
 
   NodeStatsAtomic();
   explicit NodeStatsAtomic(const NodeStatsAtomic& other);
@@ -51,6 +55,10 @@ struct NodeStats {
   double utilitySqAvg;
   double weightSum;
   double weightSqSum;
+  //Auxiliary evaluator score aggregation, for reporting only. Never used by search.
+  double auxScoreMeanAvg;
+  double auxScoreMeanSqAvg;
+  double auxLeadAvg;
 
   NodeStats();
   explicit NodeStats(const NodeStatsAtomic& other);
@@ -216,6 +224,8 @@ struct SearchNode {
   //valid to access for the duration of the search and will not be deallocated.
   std::atomic<std::shared_ptr<NNOutput>*> nnOutput;
   std::atomic<std::shared_ptr<NNOutput>*> humanOutput;
+  //Output of the auxiliary evaluator, used only for score/ownership reporting. Never used by search.
+  std::atomic<std::shared_ptr<NNOutput>*> auxOutput;
 
   //Used to coordinate various multithreaded updates.
   //During search, for updating nnOutput when it needs recomputation at the root if it wasn't updated yet.
@@ -276,14 +286,18 @@ struct SearchNode {
   const NNOutput* getNNOutput() const;
   NNOutput* getHumanOutput();
   const NNOutput* getHumanOutput() const;
+  NNOutput* getAuxOutput();
+  const NNOutput* getAuxOutput() const;
 
   //Always replaces the current nnoutput, and stores the existing one in the thread for later deletion.
   //Returns true if there was NOT already an nnOutput
   bool storeNNOutput(std::shared_ptr<NNOutput>* newNNOutput, SearchThread& thread);
   bool storeHumanOutput(std::shared_ptr<NNOutput>* newHumanOutput, SearchThread& thread);
+  bool storeAuxOutput(std::shared_ptr<NNOutput>* newAuxOutput, SearchThread& thread);
   //Only stores if there isn't an nnOutput already. Returns true if it was stored.
   bool storeNNOutputIfNull(std::shared_ptr<NNOutput>* newNNOutput);
   bool storeHumanOutputIfNull(std::shared_ptr<NNOutput>* newHumanOutput);
+  bool storeAuxOutputIfNull(std::shared_ptr<NNOutput>* newAuxOutput);
 
   //Used within search to update state and allocate children arrays
   void initializeChildren();

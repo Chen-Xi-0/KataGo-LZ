@@ -6,6 +6,7 @@
 #include "../core/datetime.h"
 #include "../core/makedir.h"
 #include "../core/test.h"
+#include <chrono>
 #include "../dataio/sgf.h"
 #include "../search/searchnode.h"
 #include "../search/asyncbot.h"
@@ -94,6 +95,9 @@ static const vector<string> knownCommands = {
   //Display raw neural net evaluations
   "kata-raw-nn",
   "kata-raw-human-nn",
+
+  //Diagnostic ladder scan using the same bounded solver as the V3+ ladder input planes
+  "kata-ladder",
 
   //Misc other stuff
   "cputime",
@@ -337,6 +341,7 @@ struct GTPEngine {
 
   const string nnModelFile;
   const string humanModelFile;
+  const string auxModelFile;
   const bool assumeMultipleStartingBlackMovesAreHandicap;
   const int analysisPVLen;
   const bool preventEncore;
@@ -349,6 +354,8 @@ struct GTPEngine {
 
   NNEvaluator* nnEval;
   NNEvaluator* humanEval;
+  //Auxiliary evaluator for score and ownership reporting only. Null if not configured.
+  NNEvaluator* auxEval;
   AsyncBot* bot;
   Rules currentRules; //Should always be the same as the rules in bot, if bot is not NULL.
 
@@ -386,7 +393,7 @@ struct GTPEngine {
   std::vector<Sgf::PositionSample> genmoveSamples;
 
   GTPEngine(
-    const string& modelFile, const string& hModelFile,
+    const string& modelFile, const string& hModelFile, const string& aModelFile,
     const SearchParams& initialGenmoveParams, const SearchParams& initialAnalysisParams,
     const Rules& initialRules,
     bool assumeMultiBlackHandicap, bool prevtEncore, bool autoPattern,
@@ -398,6 +405,7 @@ struct GTPEngine {
   )
     :nnModelFile(modelFile),
      humanModelFile(hModelFile),
+     auxModelFile(aModelFile),
      assumeMultipleStartingBlackMovesAreHandicap(assumeMultiBlackHandicap),
      analysisPVLen(pvLen),
      preventEncore(prevtEncore),
@@ -408,6 +416,7 @@ struct GTPEngine {
      handicapAvoidRepeatedPatternUtility(hcapAvoidRepeatedPatternUtility),
      nnEval(NULL),
      humanEval(NULL),
+     auxEval(NULL),
      bot(NULL),
      currentRules(initialRules),
      genmoveParams(initialGenmoveParams),
@@ -438,6 +447,7 @@ struct GTPEngine {
     delete bot;
     delete nnEval;
     delete humanEval;
+    delete auxEval;
   }
 
   void stopAndWait() {
@@ -482,9 +492,11 @@ struct GTPEngine {
         delete bot;
         delete nnEval;
         delete humanEval;
+        delete auxEval;
         bot = NULL;
         nnEval = NULL;
         humanEval = NULL;
+        auxEval = NULL;
         logger.write("Cleaned up old neural net and bot");
       }
 
@@ -511,6 +523,14 @@ struct GTPEngine {
           if(!loggingToStderr)
             cerr << warning << endl;
         }
+      }
+      if(auxModelFile != "") {
+        auxEval = Setup::initializeNNEvaluator(
+          auxModelFile,auxModelFile,expectedSha256,cfg,logger,seedRand,expectedConcurrentEvals,
+          nnXLen,nnYLen,Setup::MaxBatchSizeRequest::fromConcurrency(),defaultRequireExactNNLen,disableFP16,
+          Setup::SETUP_FOR_GTP
+        );
+        logger.write("Loaded auxiliary score/ownership net with nnXLen " + Global::intToString(auxEval->getNNXLen()) + " nnYLen " + Global::intToString(auxEval->getNNYLen()));
       }
 
       {
@@ -549,7 +569,7 @@ struct GTPEngine {
       else
         searchRandSeed = Global::uint64ToString(seedRand.nextUInt64());
 
-      bot = new AsyncBot(genmoveParams, nnEval, humanEval, &logger, searchRandSeed);
+      bot = new AsyncBot(genmoveParams, nnEval, humanEval, auxEval, &logger, searchRandSeed);
       bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
       isGenmoveParams = true;
 
@@ -1113,6 +1133,8 @@ struct GTPEngine {
     nnEval->clearStats();
     if(humanEval != NULL)
       humanEval->clearStats();
+    if(auxEval != NULL)
+      auxEval->clearStats();
     TimeControls tc = pla == P_BLACK ? bTimeControls : wTimeControls;
 
     if(!isGenmoveParams) {
@@ -1133,6 +1155,12 @@ struct GTPEngine {
         (paramsToUse.playoutDoublingAdvantagePla == C_EMPTY && pla == P_BLACK) ? -desiredDynamicPDAForWhite :
         NAN;
       testAssert(!std::isnan(desiredDynamicPDA));
+
+      //On LZ-compatible (V8) models playoutDoublingAdvantage is not a network input and is instead
+      //mapped to the dynamic virtual komi inside Search. There, a value explicitly set by the user
+      //or GUI should take precedence over the automatically computed one.
+      if(nnEval != NULL && nnEval->isLZModel() && paramsToUse.playoutDoublingAdvantage != 0.0)
+        desiredDynamicPDA = paramsToUse.playoutDoublingAdvantage;
 
       paramsToUse.playoutDoublingAdvantage = desiredDynamicPDA;
     }
@@ -1336,6 +1364,8 @@ struct GTPEngine {
     nnEval->clearCache();
     if(humanEval != NULL)
       humanEval->clearCache();
+    if(auxEval != NULL)
+      auxEval->clearCache();
   }
 
   void placeFixedHandicap(int n, string& response, bool& responseIsError) {
@@ -1458,6 +1488,8 @@ struct GTPEngine {
       tmpParams.humanSLOppExploreProbWeightless = 0.0;
       tmpParams.antiMirror = false;
       tmpParams.avoidRepeatedPatternUtility = 0;
+      //Score anticipation must reflect the real komi, not the dynamic virtual komi.
+      tmpParams.useDynamicKomi = false;
       bot->setParams(tmpParams);
     }
 
@@ -1521,6 +1553,8 @@ struct GTPEngine {
       tmpParams.humanSLOppExploreProbWeightless = 0.0;
       tmpParams.antiMirror = false;
       tmpParams.avoidRepeatedPatternUtility = 0;
+      //Score anticipation must reflect the real komi, not the dynamic virtual komi.
+      tmpParams.useDynamicKomi = false;
       bot->setParams(tmpParams);
     }
 
@@ -1663,9 +1697,11 @@ struct GTPEngine {
 
         NNOutput* nnOutput = buf.result.get();
         out << "symmetry " << symmetry << endl;
-        out << "whiteWin " << Global::strprintf("%.6f",nnOutput->whiteWinProb) << endl;
-        out << "whiteLoss " << Global::strprintf("%.6f",nnOutput->whiteLossProb) << endl;
-        out << "noResult " << Global::strprintf("%.6f",nnOutput->whiteNoResultProb) << endl;
+        // NOTE(lz-mv18 verification build): %.9g instead of %.6f for float32-lossless
+        // GTP output, so that cross-engine comparisons can be made at < 1e-6 tolerance.
+        out << "whiteWin " << Global::strprintf("%.9g",nnOutput->whiteWinProb) << endl;
+        out << "whiteLoss " << Global::strprintf("%.9g",nnOutput->whiteLossProb) << endl;
+        out << "noResult " << Global::strprintf("%.9g",nnOutput->whiteNoResultProb) << endl;
         if(useHumanModel) {
           out << "whiteScore " << Global::strprintf("%.3f",nnOutput->whiteScoreMean) << endl;
           out << "whiteScoreSq " << Global::strprintf("%.3f",nnOutput->whiteScoreMeanSq) << endl;
@@ -1687,7 +1723,7 @@ struct GTPEngine {
             if(prob < 0)
               out << "    NAN ";
             else
-              out << Global::strprintf("%8.6f ", prob);
+              out << Global::strprintf("%12.9g ", prob);
           }
           out << endl;
         }
@@ -1698,7 +1734,7 @@ struct GTPEngine {
           if(prob < 0)
             out << "    NAN "; // Probably shouldn't ever happen for pass unles the rules change, but we handle it anyways
           else
-            out << Global::strprintf("%8.6f ", prob);
+            out << Global::strprintf("%12.9g ", prob);
           out << endl;
         }
 
@@ -2060,6 +2096,7 @@ int MainCmds::gtp(const vector<string>& args) {
   ConfigParser cfg;
   string nnModelFile;
   string humanModelFile;
+  string auxModelFile;
   string overrideVersion;
   KataGoCommandLine cmd("Run KataGo main GTP engine for playing games or casual analysis.");
   try {
@@ -2071,9 +2108,12 @@ int MainCmds::gtp(const vector<string>& args) {
 
     TCLAP::ValueArg<string> overrideVersionArg("","override-version","Force KataGo to say a certain value in response to gtp version command",false,string(),"VERSION");
     cmd.add(overrideVersionArg);
+    TCLAP::ValueArg<string> auxModelArg("","aux-model","Auxiliary model used only to provide score and ownership for reporting (does not affect search)",false,string(),"FILE");
+    cmd.add(auxModelArg);
     cmd.parseArgs(args);
     nnModelFile = cmd.getModelFile();
     humanModelFile = cmd.getHumanModelFile();
+    auxModelFile = auxModelArg.getValue();
     overrideVersion = overrideVersionArg.getValue();
 
     cmd.getConfig(cfg);
@@ -2082,6 +2122,9 @@ int MainCmds::gtp(const vector<string>& args) {
     cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
     return 1;
   }
+
+  if(auxModelFile == "" && cfg.contains("auxModelFile"))
+    auxModelFile = cfg.getString("auxModelFile");
 
   Logger logger(&cfg);
 
@@ -2210,7 +2253,7 @@ int MainCmds::gtp(const vector<string>& args) {
   Player perspective = Setup::parseReportAnalysisWinrates(cfg,C_EMPTY);
 
   GTPEngine* engine = new GTPEngine(
-    nnModelFile,humanModelFile,
+    nnModelFile,humanModelFile,auxModelFile,
     initialGenmoveParams,initialAnalysisParams,
     initialRules,
     assumeMultipleStartingBlackMovesAreHandicap,preventEncore,autoAvoidPatterns,
@@ -2257,10 +2300,14 @@ int MainCmds::gtp(const vector<string>& args) {
   logger.write("Loaded model " + nnModelFile);
   if(humanModelFile != "")
     logger.write("Loaded human SL model " + humanModelFile);
+  if(auxModelFile != "")
+    logger.write("Loaded auxiliary score/ownership model " + auxModelFile);
   cmd.logOverrides(logger);
   logger.write("Model name: "+ (engine->nnEval == NULL ? string() : engine->nnEval->getInternalModelName()));
   if(engine->humanEval != NULL)
     logger.write("Human SL model name: "+ (engine->humanEval->getInternalModelName()));
+  if(engine->auxEval != NULL)
+    logger.write("Auxiliary score/ownership model name: "+ (engine->auxEval->getInternalModelName()));
   logger.write("GTP ready, beginning main protocol loop");
   //Also check loggingToStderr so that we don't duplicate the message from the log file
   if(startupPrintMessageToStderr && !logger.isLoggingToStderr()) {
@@ -2268,9 +2315,13 @@ int MainCmds::gtp(const vector<string>& args) {
     cerr << "Loaded model " << nnModelFile << endl;
     if(humanModelFile != "")
       cerr << "Loaded human SL model " << humanModelFile << endl;
+    if(auxModelFile != "")
+      cerr << "Loaded auxiliary score/ownership model " << auxModelFile << endl;
     cerr << "Model name: "+ (engine->nnEval == NULL ? string() : engine->nnEval->getInternalModelName()) << endl;
     if(engine->humanEval != NULL)
       cerr << "Human SL model name: "+ (engine->humanEval->getInternalModelName()) << endl;
+    if(engine->auxEval != NULL)
+      cerr << "Auxiliary score/ownership model name: "+ (engine->auxEval->getInternalModelName()) << endl;
     cerr << "GTP ready, beginning main protocol loop" << endl;
   }
 
@@ -3644,6 +3695,33 @@ int MainCmds::gtp(const vector<string>& args) {
         const bool useHumanModel = false;
         response = engine->rawNN(whichSymmetry, policyOptimism, useHumanModel, pla);
       }
+    }
+
+    else if(command == "kata-ladder") {
+      //Diagnostic: list ladder-captured groups and their working capture moves. Uses the same
+      //bounded solver that fills the V3+ ladder input planes, so it is model-independent.
+      const Board& rootBoard = engine->bot->getRootBoard();
+      const auto startTime = std::chrono::steady_clock::now();
+      vector<pair<Loc,vector<Loc>>> found;
+      NNInputs::iterateLadders(rootBoard, [&](Loc loc, const vector<Loc>& workingMoves) {
+        found.emplace_back(loc, workingMoves);
+      });
+      const double elapsedMs = std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now() - startTime
+      ).count();
+      ostringstream out;
+      for(size_t i = 0; i<found.size(); i++) {
+        if(i > 0) out << ";";
+        out << Location::toString(found[i].first, rootBoard) << "|";
+        const vector<Loc>& workingMoves = found[i].second;
+        for(size_t j = 0; j<workingMoves.size(); j++) {
+          if(j > 0) out << ",";
+          out << Location::toString(workingMoves[j], rootBoard);
+        }
+      }
+      if(found.empty()) out << "none";
+      out << " (" << elapsedMs << " ms)";
+      response = out.str();
     }
 
     else if(command == "kata-raw-human-nn") {

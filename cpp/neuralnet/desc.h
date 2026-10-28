@@ -110,6 +110,12 @@ struct MatMulLayerDesc {
 
   void scaleOutputChannels(const std::vector<float>& scaling);
 
+  //Scales groups of input channels by per-channel factors. Assumes the inputs are laid out as
+  //numGroups contiguous spatial positions each with scaling.size() channels, position-major and
+  //channel-minor: input index = pos * scaling.size() + c. Used when folding batch norm scale
+  //factors forward into a matmul that consumes a flattened spatial tensor (mv18 LZ-style heads).
+  void scaleInputChannels(const std::vector<float>& scaling);
+
   void releaseWeights();
 };
 
@@ -142,9 +148,15 @@ struct ResidualBlockDesc {
   BatchNormLayerDesc midBN;
   ActivationLayerDesc midActivation;
   ConvLayerDesc finalConv;
+  //Only parsed when hasPostNorm is true (block kind "postnorm_block"). Applied to the trunk
+  //flow after the residual accumulation, before the next block. Unused (numChannels == 0)
+  //for ordinary blocks.
+  BatchNormLayerDesc postBN;
+  ActivationLayerDesc postActivation;
+  bool hasPostNorm;
 
   ResidualBlockDesc();
-  ResidualBlockDesc(std::istream& in, int modelVersion, bool binaryFloats);
+  ResidualBlockDesc(std::istream& in, int modelVersion, bool binaryFloats, bool parsePostNorm = false);
   ResidualBlockDesc(ResidualBlockDesc&& other);
 
   ResidualBlockDesc(const ResidualBlockDesc&) = delete;
@@ -376,6 +388,12 @@ constexpr int GLOBAL_POOLING_BLOCK_KIND = 2;
 constexpr int NESTED_BOTTLENECK_BLOCK_KIND = 3;
 constexpr int TRANSFORMER_ATTENTION_BLOCK_KIND = 4;
 constexpr int TRANSFORMER_FFN_BLOCK_KIND = 5;
+//Private extension (model version 18, Leela-Zero weight loading): an ordinary residual block
+//followed by an extra batch norm + activation applied AFTER the residual accumulation.
+//Leela Zero's trunk is x_i = ReLU(x_{i-1} + BN_b(conv_b(ReLU(BN_a(conv_a(x_{i-1})))))), i.e. it
+//has a nonlinearity on the residual sum itself, which stock KataGo blocks cannot express. Old
+//model files never contain this kind token, so they are entirely unaffected.
+constexpr int POSTNORM_BLOCK_KIND = 6;
 
 struct TrunkDesc {
   std::string name;
@@ -431,6 +449,15 @@ struct PolicyHeadDesc {
   MatMulLayerDesc gpoolToBiasMul;
   BatchNormLayerDesc p1BN;
   ActivationLayerDesc p1Activation;
+  //mv18 and later: optional full-connected policy head replacing the p2Conv + global pooling pass
+  //path, used for loading Leela-Zero-style policy heads. When hasFullPolicyMul is true, pFullMul
+  //consumes the flattened spatial p1Activation output (numSpatial * p1BN.numChannels inputs) and
+  //produces policyOutChannels * (numSpatial + 1) outputs: per-position logits (ordered
+  //position-major, channel-minor: index = (y * nnXLen + x) * policyOutChannels + c) followed by
+  //policyOutChannels pass logits at the end.
+  bool hasFullPolicyMul;
+  MatMulLayerDesc pFullMul;
+  MatBiasLayerDesc pFullMulBias;
   ConvLayerDesc p2Conv;
   MatMulLayerDesc gpoolToPassMul;
   MatBiasLayerDesc gpoolToPassBias;
@@ -459,6 +486,11 @@ struct PolicyHeadDesc {
 struct ValueHeadDesc {
   std::string name;
   int modelVersion;
+  //mv18 and later: if true, v2Mul consumes the flattened spatial v1Activation output
+  //(nnXLen * nnYLen * v1BN.numChannels inputs, ordered position-major and channel-minor:
+  //index = (y * nnXLen + x) * v1BN.numChannels + c) directly instead of the 3 global pooling
+  //statistics, used for loading Leela-Zero-style value heads.
+  bool hasFullValueMul;
   ConvLayerDesc v1Conv;
   BatchNormLayerDesc v1BN;
   ActivationLayerDesc v1Activation;
@@ -526,6 +558,15 @@ struct ModelDesc {
   //True if the model expects territory scoring with TaxRule NONE (both for adjudication and for its
   //territory input features) to exclude empty points adjacent to chains in atari, per rules version 3.
   bool preferExcludeTerritoryAdjacentToAtari;
+
+  //mv18 and later: true if the value head's (win,loss,draw) triple is from black's perspective
+  //rather than the perspective of the player to move (as Leela Zero v2/ELF nets are).
+  bool valueFromBlackPerspective;
+
+  //True if this desc was converted from Leela Zero / ELF weights by LZConverter. Identifies LZ
+  //models independently of modelVersion, so runtime behavior (V8 inputs, dummy score head,
+  //dynamic virtual komi) is keyed off the actual weight format rather than a version number.
+  bool isLZModel;
 
   ModelPostProcessParams postProcessParams;
 

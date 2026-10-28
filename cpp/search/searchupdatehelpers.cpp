@@ -40,6 +40,28 @@ void Search::addLeafValue(
   double utilitySq = utility * utility;
   double weightSq = weight * weight;
 
+  //Auxiliary score values, for reporting only. Terminal nodes have no aux eval, but their score is objective,
+  //so reuse the terminal score that was passed in.
+  bool hasAuxScore = false;
+  double auxScoreMean = 0.0;
+  double auxScoreMeanSq = 0.0;
+  double auxLead = 0.0;
+  if(auxEvaluator != NULL) {
+    const NNOutput* auxOutput = node.getAuxOutput();
+    if(auxOutput != NULL) {
+      auxScoreMean = (double)auxOutput->whiteScoreMean;
+      auxScoreMeanSq = (double)auxOutput->whiteScoreMeanSq;
+      auxLead = (double)auxOutput->whiteLead;
+      hasAuxScore = true;
+    }
+    else if(isTerminal) {
+      auxScoreMean = scoreMean;
+      auxScoreMeanSq = scoreMeanSq;
+      auxLead = lead;
+      hasAuxScore = true;
+    }
+  }
+
   if(assumeNoExistingWeight) {
     while(node.statsLock.test_and_set(std::memory_order_acquire));
     node.stats.winLossValueAvg.store(winLossValue,std::memory_order_release);
@@ -51,6 +73,11 @@ void Search::addLeafValue(
     node.stats.utilitySqAvg.store(utilitySq,std::memory_order_release);
     node.stats.weightSqSum.store(weightSq,std::memory_order_release);
     node.stats.weightSum.store(weight,std::memory_order_release);
+    if(hasAuxScore) {
+      node.stats.auxScoreMeanAvg.store(auxScoreMean,std::memory_order_release);
+      node.stats.auxScoreMeanSqAvg.store(auxScoreMeanSq,std::memory_order_release);
+      node.stats.auxLeadAvg.store(auxLead,std::memory_order_release);
+    }
     int64_t oldVisits = node.stats.visits.fetch_add(1,std::memory_order_release);
     node.statsLock.clear(std::memory_order_release);
     // This should only be possible in the extremely rare case that we transpose to a terminal node from a non-terminal node probably due to
@@ -75,6 +102,11 @@ void Search::addLeafValue(
     node.stats.utilitySqAvg.store((node.stats.utilitySqAvg.load(std::memory_order_relaxed) * oldWeightSum + utilitySq * weight)/newWeightSum,std::memory_order_release);
     node.stats.weightSqSum.store(node.stats.weightSqSum.load(std::memory_order_relaxed) + weightSq,std::memory_order_release);
     node.stats.weightSum.store(newWeightSum,std::memory_order_release);
+    if(hasAuxScore) {
+      node.stats.auxScoreMeanAvg.store((node.stats.auxScoreMeanAvg.load(std::memory_order_relaxed) * oldWeightSum + auxScoreMean * weight)/newWeightSum,std::memory_order_release);
+      node.stats.auxScoreMeanSqAvg.store((node.stats.auxScoreMeanSqAvg.load(std::memory_order_relaxed) * oldWeightSum + auxScoreMeanSq * weight)/newWeightSum,std::memory_order_release);
+      node.stats.auxLeadAvg.store((node.stats.auxLeadAvg.load(std::memory_order_relaxed) * oldWeightSum + auxLead * weight)/newWeightSum,std::memory_order_release);
+    }
     node.stats.visits.fetch_add(1,std::memory_order_release);
     node.statsLock.clear(std::memory_order_release);
   }
@@ -257,6 +289,9 @@ void Search::recomputeNodeStats(SearchNode& node, SearchThread& thread, int numV
   double utilitySqSum = 0.0;
   double weightSqSum = 0.0;
   double weightSum = currentTotalChildWeight;
+  double auxScoreMeanSum = 0.0;
+  double auxScoreMeanSqSum = 0.0;
+  double auxLeadSum = 0.0;
   for(int i = 0; i<numGoodChildren; i++) {
     const NodeStats& stats = statsBuf[i].stats;
 
@@ -271,6 +306,11 @@ void Search::recomputeNodeStats(SearchNode& node, SearchThread& thread, int numV
     utilitySum += desiredWeight * stats.utilityAvg;
     utilitySqSum += desiredWeight * stats.utilitySqAvg;
     weightSqSum += weightScaling * weightScaling * stats.weightSqSum;
+    if(auxEvaluator != NULL) {
+      auxScoreMeanSum += desiredWeight * stats.auxScoreMeanAvg;
+      auxScoreMeanSqSum += desiredWeight * stats.auxScoreMeanSqAvg;
+      auxLeadSum += desiredWeight * stats.auxLeadAvg;
+    }
   }
 
   //Also add in the direct evaluation of this node.
@@ -334,6 +374,14 @@ void Search::recomputeNodeStats(SearchNode& node, SearchThread& thread, int numV
     utilitySqSum += utility * utility * weight;
     weightSqSum += weight * weight;
     weightSum += weight;
+    if(auxEvaluator != NULL) {
+      const NNOutput* auxOutput = node.getAuxOutput();
+      if(auxOutput != NULL) {
+        auxScoreMeanSum += (double)auxOutput->whiteScoreMean * weight;
+        auxScoreMeanSqSum += (double)auxOutput->whiteScoreMeanSq * weight;
+        auxLeadSum += (double)auxOutput->whiteLead * weight;
+      }
+    }
   }
 
   double winLossValueAvg = winLossValueSum / weightSum;
@@ -372,6 +420,11 @@ void Search::recomputeNodeStats(SearchNode& node, SearchThread& thread, int numV
   node.stats.utilitySqAvg.store(utilitySqAvg,std::memory_order_release);
   node.stats.weightSqSum.store(weightSqSum,std::memory_order_release);
   node.stats.weightSum.store(weightSum,std::memory_order_release);
+  if(auxEvaluator != NULL) {
+    node.stats.auxScoreMeanAvg.store(auxScoreMeanSum / weightSum,std::memory_order_release);
+    node.stats.auxScoreMeanSqAvg.store(auxScoreMeanSqSum / weightSum,std::memory_order_release);
+    node.stats.auxLeadAvg.store(auxLeadSum / weightSum,std::memory_order_release);
+  }
   node.stats.visits.fetch_add(numVisitsToAdd,std::memory_order_release);
   if(newVisitCapSnapshot != NULL) {
     VisitCapSnapshot* expected = NULL;

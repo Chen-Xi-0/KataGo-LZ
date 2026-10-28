@@ -1,4 +1,4 @@
-#ifdef USE_OPENCL_BACKEND
+﻿﻿#ifdef USE_OPENCL_BACKEND
 
 #include "../neuralnet/nninterface.h"
 #include "../neuralnet/openclincludes.h"
@@ -173,6 +173,8 @@ struct CompiledPrograms {
   CLProgram transformerApplyRoPEProgram;
   CLProgram transformerSwiGLUProgram;
   CLProgram addPointWiseProgram;
+  CLProgram policyFullSplitProgram;
+  CLProgram fullMatMulProgram;
   CLProgram sumChannelsNCHWProgram;
   CLProgram gPoolChannelsNCHWMaskProgram;
   CLProgram valueHeadPoolChannelsNCHWProgram;
@@ -308,6 +310,14 @@ struct CompiledPrograms {
     );
     addPointWiseProgram = compileProgram(
       "addPointWiseProgram", context, deviceIdsToUse, OpenCLKernels::addPointWise,
+      tuneParams.pointWise.compileOptions() + " " + maybeFP16CompileOptions
+    );
+    policyFullSplitProgram = compileProgram(
+      "policyFullSplitProgram", context, deviceIdsToUse, OpenCLKernels::policyFullSplit,
+      tuneParams.pointWise.compileOptions() + " " + maybeFP16CompileOptions
+    );
+    fullMatMulProgram = compileProgram(
+      "fullMatMulProgram", context, deviceIdsToUse, OpenCLKernels::fullMatMul,
       tuneParams.pointWise.compileOptions() + " " + maybeFP16CompileOptions
     );
     sumChannelsNCHWProgram = compileProgram(
@@ -597,6 +607,8 @@ struct ComputeHandleInternal {
   CLKernel transformerApplyRoPEKernel;
   CLKernel transformerSwiGLUKernel;
   CLKernel addPointWiseKernel;
+  CLKernel policyFullSplitKernel;
+  CLKernel fullMatMulKernel;
   CLKernel sumChannelsNCHWKernel;
   CLKernel gPoolChannelsNCHWMaskKernel;
   CLKernel valueHeadPoolChannelsNCHWKernel;
@@ -700,6 +712,10 @@ struct ComputeHandleInternal {
     transformerSwiGLUKernel = clCreateKernel(progs->transformerSwiGLUProgram, "transformerSwiGLU", &err);
     CHECK_ERR(err);
     addPointWiseKernel = clCreateKernel(progs->addPointWiseProgram, "addPointWise", &err);
+    CHECK_ERR(err);
+    policyFullSplitKernel = clCreateKernel(progs->policyFullSplitProgram, "policyFullSplit", &err);
+    CHECK_ERR(err);
+    fullMatMulKernel = clCreateKernel(progs->fullMatMulProgram, "fullMatMul", &err);
     CHECK_ERR(err);
     sumChannelsNCHWKernel = clCreateKernel(progs->sumChannelsNCHWProgram, "sumChannelsNCHW", &err);
     CHECK_ERR(err);
@@ -838,6 +854,36 @@ static void addPointWise(ComputeHandleInternal* handle, cl_mem acc, cl_mem value
   err = OpenCLHelpers::doAddPointWise(handle->addPointWiseKernel, handle->commandQueue, handle->tuneParams, acc, value, totalSize, MAYBE_EVENTREF);
   CHECK_ERR(err);
   MAYBE_PROFILE("AddPointWise");
+  MAYBE_FREE_EVENT;
+}
+
+static void policyFullSplit(
+  ComputeHandleInternal* handle, cl_mem full, cl_mem policy, cl_mem policyPass,
+  int batchSize, int numSpatial, int paddedNNXYLen, int numPolicyChannels, int numOutChannels
+) {
+  cl_int err;
+  MAYBE_EVENT;
+  err = OpenCLHelpers::doPolicyFullSplit(
+    handle->policyFullSplitKernel, handle->commandQueue, full, policy, policyPass,
+    batchSize, numSpatial, paddedNNXYLen, numPolicyChannels, numOutChannels, MAYBE_EVENTREF
+  );
+  CHECK_ERR(err);
+  MAYBE_PROFILE("PolicyFullSplit");
+  MAYBE_FREE_EVENT;
+}
+
+static void fullMatMul(
+  ComputeHandleInternal* handle, cl_mem input, cl_mem weights, cl_mem output,
+  int batchSize, int numChannels, int xySize, int outChannels
+) {
+  cl_int err;
+  MAYBE_EVENT;
+  err = OpenCLHelpers::doFullMatMul(
+    handle->fullMatMulKernel, handle->commandQueue, input, weights, output,
+    batchSize, numChannels, xySize, outChannels, MAYBE_EVENTREF
+  );
+  CHECK_ERR(err);
+  MAYBE_PROFILE("FullMatMul");
   MAYBE_FREE_EVENT;
 }
 
@@ -1744,7 +1790,9 @@ struct NormActConv {
     cl_mem convWorkspace,
     cl_mem convWorkspace2
   ) const {
-    if(conv.canApplyWithBNAct())
+    //The fused kernels always include an activation. LZ-style postnorm blocks use BN with
+    //ACTIVATION_IDENTITY before the conv, so fall back to separate BN and conv in that case.
+    if(conv.canApplyWithBNAct() && norm.activation != ACTIVATION_IDENTITY)
       conv.applyWithBNAct(handle,&norm,batchSize,input,output,mask,convWorkspace,convWorkspace2);
     else {
       norm.apply(handle,batchSize,input,inputScratchOrInput,mask);
@@ -1766,6 +1814,8 @@ struct ResidualBlock {
   const NormActConv normActConv1;
   const NormActConv normActConv2;
   const int paddedNNXYLen;
+  const bool hasPostNorm;
+  std::unique_ptr<BatchNormLayer> postBN;
 
   ResidualBlock(
     ComputeHandleInternal* handle,
@@ -1777,8 +1827,11 @@ struct ResidualBlock {
     name(desc->name),
     normActConv1(handle,&desc->preBN,&desc->preActivation,&desc->regularConv,nnX,nnY,useFP16),
     normActConv2(handle,&desc->midBN,&desc->midActivation,&desc->finalConv,nnX,nnY,useFP16),
-    paddedNNXYLen(handle->paddedNNXYLen)
+    paddedNNXYLen(handle->paddedNNXYLen),
+    hasPostNorm(desc->hasPostNorm)
   {
+    if(hasPostNorm)
+      postBN = std::make_unique<BatchNormLayer>(handle,&desc->postBN,&desc->postActivation,useFP16);
   }
 
   ~ResidualBlock() {
@@ -1805,6 +1858,9 @@ struct ResidualBlock {
     normActConv1.apply(handle,batchSize,trunk,trunkScratch,mid.buf,mask,convWorkspace,convWorkspace2);
     normActConv2.apply(handle,batchSize,mid.buf,mid.buf,trunkScratch,mask,convWorkspace,convWorkspace2);
     addPointWise(handle, trunk, trunkScratch, checkedTotalElts(batchSize, normActConv2.outChannels, paddedNNXYLen, "OpenCL addPointWise"));
+    //Leela-Zero-style post-norm residual: batch norm + activation on the trunk flow itself.
+    if(hasPostNorm)
+      postBN->apply(handle,batchSize,trunk,trunk,mask);
   }
 
   ResidualBlock() = delete;
@@ -2822,7 +2878,7 @@ BlockStack::BlockStack(
 {
   testAssert(descBlocks.size() == numBlocks);
   for(int i = 0; i<numBlocks; i++) {
-    if(descBlocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(descBlocks[i].first == ORDINARY_BLOCK_KIND || descBlocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlockDesc* blockDesc = (ResidualBlockDesc*)descBlocks[i].second.get();
       unique_ptr_void blockPtr = make_unique_void(
         new ResidualBlock(
@@ -2833,7 +2889,7 @@ BlockStack::BlockStack(
           useFP16
         )
       );
-      blocks.emplace_back(ORDINARY_BLOCK_KIND,std::move(blockPtr));
+      blocks.emplace_back(descBlocks[i].first,std::move(blockPtr));
     }
     else if(descBlocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
       GlobalPoolingResidualBlockDesc* blockDesc = (GlobalPoolingResidualBlockDesc*)descBlocks[i].second.get();
@@ -2888,7 +2944,7 @@ ConvWorkspaceEltsNeeded BlockStack::requiredConvWorkspaceElts(ComputeHandleInter
   ConvWorkspaceEltsNeeded maxElts;
 
   for(int i = 0; i<blocks.size(); i++) {
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlock* block = (ResidualBlock*)blocks[i].second.get();
       maxElts = ConvWorkspaceEltsNeeded::getMax(maxElts,block->requiredConvWorkspaceElts(handle,maxBatchSize));
     }
@@ -2931,7 +2987,7 @@ void BlockStack::apply(
     debugPrint3D("OPENCL Blockstack block " + Global::intToString(i), handle, trunk, batchSize, trunkNumChannels, mask);
 #endif
 
-    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND || blocks[i].first == POSTNORM_BLOCK_KIND) {
       ResidualBlock* block = (ResidualBlock*)blocks[i].second.get();
       block->apply(
         handle,
@@ -3193,6 +3249,10 @@ struct PolicyHead {
   std::unique_ptr<MatBiasLayer> gpoolToPassBias;
   std::unique_ptr<MatMulLayer> gpoolToPassMul2;
 
+  bool hasFullPolicyMul;
+  std::unique_ptr<MatMulLayer> pFullMul;
+  std::unique_ptr<MatBiasLayer> pFullMulBias;
+
   PolicyHead() = delete;
   PolicyHead(const PolicyHead&) = delete;
   PolicyHead& operator=(const PolicyHead&) = delete;
@@ -3211,7 +3271,8 @@ struct PolicyHead {
     paddedNNXYLen(handle->paddedNNXYLen),
     p1Channels(desc->p1Conv.outChannels),
     g1Channels(desc->g1Conv.outChannels),
-    p2Channels(desc->p2Conv.outChannels)
+    p2Channels(desc->p2Conv.outChannels),
+    hasFullPolicyMul(desc->hasFullPolicyMul)
   {
     p1Conv = std::make_unique<ConvLayer>(handle,&desc->p1Conv,nnXLen,nnYLen,useFP16);
     g1Conv = std::make_unique<ConvLayer>(handle,&desc->g1Conv,nnXLen,nnYLen,useFP16);
@@ -3222,6 +3283,24 @@ struct PolicyHead {
     gpoolToPassMul = std::make_unique<MatMulLayer>(handle,&desc->gpoolToPassMul);
     gpoolToPassBias = std::make_unique<MatBiasLayer>(handle,&desc->gpoolToPassBias,desc->passActivation.activation);
     gpoolToPassMul2 = std::make_unique<MatMulLayer>(handle,&desc->gpoolToPassMul2);
+
+    if(hasFullPolicyMul) {
+      //The fully-connected policy head consumes the whole flattened p1 feature map, which in
+      //OpenCL buffers is padded out to paddedNNXYLen positions. Zero-pad the trailing weights
+      //so that the padded input channels contribute nothing.
+      testAssert(desc->pFullMul.inChannels == p1Channels * nnXLen * nnYLen);
+      MatMulLayerDesc paddedDesc;
+      paddedDesc.name = desc->pFullMul.name;
+      paddedDesc.inChannels = p1Channels * paddedNNXYLen;
+      paddedDesc.outChannels = desc->pFullMul.outChannels;
+      paddedDesc.weights.assign((size_t)paddedDesc.inChannels * paddedDesc.outChannels, 0.0f);
+      for(int ic = 0; ic < desc->pFullMul.inChannels; ic++)
+        for(int oc = 0; oc < paddedDesc.outChannels; oc++)
+          paddedDesc.weights[(size_t)ic * paddedDesc.outChannels + oc] =
+            desc->pFullMul.weights[(size_t)ic * paddedDesc.outChannels + oc];
+      pFullMul = std::make_unique<MatMulLayer>(handle,&paddedDesc);
+      pFullMulBias = std::make_unique<MatBiasLayer>(handle,&desc->pFullMulBias,ACTIVATION_IDENTITY);
+    }
   }
 
   ~PolicyHead() {
@@ -3248,12 +3327,26 @@ struct PolicyHead {
     cl_mem convWorkspace2
   ) const {
     SizedBuf<cl_mem> p1Out(scratch->allocator, scratch->getBufSizeXY(p1Channels));
+
+    p1Conv->apply(handle,batchSize,trunk,p1Out.buf,convWorkspace,convWorkspace2);
+
+    if(hasFullPolicyMul) {
+      p1BN->apply(handle,batchSize,p1Out.buf,p1Out.buf,mask);
+      SizedBuf<cl_mem> pFullOut(scratch->allocator, scratch->getBufSizeFloat(pFullMul->outChannels));
+      //pFullMul consumes the stored (possibly FP16) NCHW spatial buffer directly, unlike MatMulLayer.
+      fullMatMul(handle,p1Out.buf,pFullMul->matBuf,pFullOut.buf,batchSize,p1Channels,paddedNNXYLen,pFullMul->outChannels);
+      pFullMulBias->apply(handle,batchSize,pFullOut.buf);
+      policyFullSplit(
+        handle,pFullOut.buf,policy,policyPass,batchSize,
+        nnXLen*nnYLen,paddedNNXYLen,p2Channels,pFullMul->outChannels
+      );
+      return;
+    }
+
     SizedBuf<cl_mem> gpoolOut(scratch->allocator, scratch->getBufSizeXY(g1Channels));
     SizedBuf<cl_mem> gpoolConcat(scratch->allocator, scratch->getBufSizeFloat(g1Channels*3));
     SizedBuf<cl_mem> gpoolBias(scratch->allocator, scratch->getBufSizeFloat(p1Channels));
     SizedBuf<cl_mem> p1Pass(scratch->allocator, scratch->getBufSizeFloat(p1Channels));
-
-    p1Conv->apply(handle,batchSize,trunk,p1Out.buf,convWorkspace,convWorkspace2);
 
     g1Conv->apply(handle,batchSize,trunk,gpoolOut.buf,convWorkspace,convWorkspace2);
     g1BN->apply(handle,batchSize,gpoolOut.buf,gpoolOut.buf,mask);
@@ -3305,6 +3398,7 @@ struct ValueHead {
   int valueChannels;
   int scoreValueChannels;
   int ownershipChannels;
+  bool hasFullValueMul;
 
   std::unique_ptr<ConvLayer> v1Conv;
   std::unique_ptr<BatchNormLayer> v1BN;
@@ -3337,10 +3431,27 @@ struct ValueHead {
     valueChannels = desc->v3Mul.outChannels;
     scoreValueChannels = desc->sv3Mul.outChannels;
     ownershipChannels = desc->vOwnershipConv.outChannels;
+    hasFullValueMul = desc->hasFullValueMul;
 
     v1Conv = std::make_unique<ConvLayer>(handle,&desc->v1Conv,nnXLen,nnYLen,useFP16);
     v1BN = std::make_unique<BatchNormLayer>(handle,&desc->v1BN,&desc->v1Activation,useFP16);
-    v2Mul = std::make_unique<MatMulLayer>(handle,&desc->v2Mul);
+    if(hasFullValueMul) {
+      //Same trailing zero-padding of the flattened v1 feature map as in the full policy head.
+      testAssert(desc->v2Mul.inChannels == v1Channels * nnXLen * nnYLen);
+      MatMulLayerDesc paddedDesc;
+      paddedDesc.name = desc->v2Mul.name;
+      paddedDesc.inChannels = v1Channels * paddedNNXYLen;
+      paddedDesc.outChannels = desc->v2Mul.outChannels;
+      paddedDesc.weights.assign((size_t)paddedDesc.inChannels * paddedDesc.outChannels, 0.0f);
+      for(int ic = 0; ic < desc->v2Mul.inChannels; ic++)
+        for(int oc = 0; oc < paddedDesc.outChannels; oc++)
+          paddedDesc.weights[(size_t)ic * paddedDesc.outChannels + oc] =
+            desc->v2Mul.weights[(size_t)ic * paddedDesc.outChannels + oc];
+      v2Mul = std::make_unique<MatMulLayer>(handle,&paddedDesc);
+    }
+    else {
+      v2Mul = std::make_unique<MatMulLayer>(handle,&desc->v2Mul);
+    }
     v2Bias = std::make_unique<MatBiasLayer>(handle,&desc->v2Bias,desc->v2Activation.activation);
     v3Mul = std::make_unique<MatMulLayer>(handle,&desc->v3Mul);
     v3Bias = std::make_unique<MatBiasLayer>(handle,&desc->v3Bias,ACTIVATION_IDENTITY);
@@ -3379,9 +3490,13 @@ struct ValueHead {
     v1Conv->apply(handle,batchSize,trunk,v1Out.buf,convWorkspace,convWorkspace2);
     v1BN->apply(handle,batchSize,v1Out.buf,v1Out.buf,mask);
 
-    performValueHeadPool(handle, batchSize, v1Channels, paddedNNXYLen, v1Out.buf, v1Mean.buf, maskSum);
-
-    v2Mul->apply(handle,batchSize,v1Mean.buf,v2Out.buf);
+    if(hasFullValueMul) {
+      fullMatMul(handle,v1Out.buf,v2Mul->matBuf,v2Out.buf,batchSize,v1Channels,paddedNNXYLen,v2Mul->outChannels);
+    }
+    else {
+      performValueHeadPool(handle, batchSize, v1Channels, paddedNNXYLen, v1Out.buf, v1Mean.buf, maskSum);
+      v2Mul->apply(handle,batchSize,v1Mean.buf,v2Out.buf);
+    }
     v2Bias->apply(handle,batchSize,v2Out.buf);
     v3Mul->apply(handle,batchSize,v2Out.buf,value);
     v3Bias->apply(handle,batchSize,value);
@@ -3673,7 +3788,9 @@ struct Buffers {
 
     trunk = createReadWriteBuffer(handle, m.trunk->trunkNumChannels * batchXYElts, useFP16);
 
-    if(m.modelVersion >= 17)
+    if(m.policyHead->hasFullPolicyMul)
+      testAssert(m.policyHead->p2Channels == 1);
+    else if(m.modelVersion >= 17)
       testAssert(m.policyHead->p2Channels == 2 || m.policyHead->p2Channels == 4);
     else if(m.modelVersion >= 16)
       testAssert(m.policyHead->p2Channels == 4);

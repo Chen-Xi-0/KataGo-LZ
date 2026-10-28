@@ -5141,7 +5141,9 @@ void OpenCLTuner::autoTuneEverything(
   string gpuName = allDeviceInfos[gpuIdxForTuning].name;
 
   //Just hardcodedly tune all the models that KataGo's main run uses.
-  static_assert(NNModelVersion::latestModelVersionImplemented == 17, "");
+  //Model version 18 (Leela-Zero-style models, only used by the Eigen backend and the
+  //OpenCL extension in this tree) is not part of the hardcoded tuning list.
+  static_assert(NNModelVersion::latestModelVersionImplemented >= 17, "");
   vector<ModelInfoForTuning> modelInfos;
   {
     ModelInfoForTuning modelInfo;

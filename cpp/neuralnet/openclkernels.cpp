@@ -805,6 +805,64 @@ __kernel void addPointWise(
 }
 )%%";
 
+string OpenCLKernels::policyFullSplit = OpenCLKernels::common + R"%%(
+//Split the output of a Leela-Zero-style fully-connected policy head into the policy and
+//policyPass buffers. full holds numOutChannels values per batch element: numSpatial
+//per-position logits (position-major, channel-minor) followed by the pass logits.
+__kernel void policyFullSplit(
+  __global float* full,
+  __global realstore* policy,
+  __global float* policyPass,
+  int numSpatial,
+  int paddedNNXYLen,
+  int numPolicyChannels,
+  int numOutChannels
+) {
+  const int i = get_global_id(0);
+  const int n = get_global_id(1);
+  if(i >= numSpatial)
+    return;
+  const int batchPolicyStride = paddedNNXYLen * numPolicyChannels;
+  for(int c = 0; c < numPolicyChannels; c++)
+    STORE(policy, n * batchPolicyStride + i * numPolicyChannels + c, full[n * numOutChannels + i * numPolicyChannels + c]);
+  if(i == 0) {
+    for(int c = 0; c < numPolicyChannels; c++)
+      policyPass[n * numPolicyChannels + c] = full[n * numOutChannels + numSpatial * numPolicyChannels + c];
+  }
+}
+)%%";
+
+string OpenCLKernels::fullMatMul = OpenCLKernels::common + R"%%(
+//Fully-connected layer applied to a flattened spatial feature map, reading the stored (possibly
+//FP16) activations and writing FP32. Used by the Leela-Zero-style policy and value heads, whose
+//inputs span the entire padded feature map. The OpenCL buffers are NCHW (channel-major), while the
+//weight rows are laid out position-major and channel-minor, matching the flattened tensor that the
+//CPU backends feed into the matmul.
+__kernel void fullMatMul(
+  __global realstore* restrict input,  //N, numChannels, xySize
+  __global float* restrict weights,    //outChannels, xySize*numChannels (position-major)
+  __global float* restrict output,     //N, outChannels
+  int numChannels,
+  int xySize,
+  int outChannels
+) {
+  const int j = get_global_id(0);
+  const int n = get_global_id(1);
+  if(j >= outChannels)
+    return;
+  __global const float* w = weights + (size_t)j * (size_t)xySize * (size_t)numChannels;
+  __global const realstore* in = input + (size_t)n * (size_t)xySize * (size_t)numChannels;
+  float sum = 0.0f;
+  for(int c = 0; c < numChannels; c++) {
+    __global const realstore* inC = in + (size_t)c * (size_t)xySize;
+    __global const float* wC = w + (size_t)c;
+    for(int pos = 0; pos < xySize; pos++)
+      sum += LOAD(inC,pos) * wC[(size_t)pos * (size_t)numChannels];
+  }
+  output[(size_t)n * (size_t)outChannels + j] = sum;
+}
+)%%";
+
 string OpenCLKernels::sumChannelsNCHW = OpenCLKernels::common + R"%%(
 //Defines:
 //XYSTRIDE - power of two parallelism stride for reduction, should be get_local_size(0)

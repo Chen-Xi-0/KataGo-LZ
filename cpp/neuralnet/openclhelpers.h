@@ -257,6 +257,33 @@ namespace OpenCLHelpers {
     cl_event* eventBuf
   );
 
+  cl_int doPolicyFullSplit(
+    cl_kernel kernel,
+    cl_command_queue commandQueue,
+    cl_mem full,
+    cl_mem policy,
+    cl_mem policyPass,
+    int batchSize,
+    int numSpatial,
+    int paddedNNXYLen,
+    int numPolicyChannels,
+    int numOutChannels,
+    cl_event* eventBuf
+  );
+
+  cl_int doFullMatMul(
+    cl_kernel kernel,
+    cl_command_queue commandQueue,
+    cl_mem input,
+    cl_mem weights,
+    cl_mem output,
+    int batchSize,
+    int numChannels,
+    int xySize,
+    int outChannels,
+    cl_event* eventBuf
+  );
+
   cl_int doSwiGLU(
     cl_kernel kernel,
     cl_command_queue commandQueue,

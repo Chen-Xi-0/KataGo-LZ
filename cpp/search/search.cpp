@@ -70,6 +70,9 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, Logger* lg, cons
   :Search(params,nnEval,NULL,lg,rSeed)
 {}
 Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* humanEval, Logger* lg, const string& rSeed)
+  :Search(params,nnEval,humanEval,NULL,lg,rSeed)
+{}
+Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* humanEval, NNEvaluator* auxEval, Logger* lg, const string& rSeed)
   :rootPla(P_BLACK),
    rootBoard(),
    rootHistory(),
@@ -85,7 +88,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    mirrorAdvantage(0.0),
    mirrorCenterSymmetryError(1e10),
    alwaysIncludeOwnerMap(false),
-   searchParams(params),numSearchesBegun(0),searchNodeAge(0),
+   searchParams(params),currentDynamicKomi(0.0f),dynamicKomiSet(false),numSearchesBegun(0),searchNodeAge(0),
    plaThatSearchIsFor(C_EMPTY),plaThatSearchIsForLastSearch(C_EMPTY),
    visitCapForBlack(0),visitCapForWhite(0),
    lastSearchNumPlayouts(0),
@@ -100,6 +103,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    logger(lg),
    nnEvaluator(nnEval),
    humanEvaluator(humanEval),
+   auxEvaluator(auxEval),
    nnXLen(),
    nnYLen(),
    policySize(),
@@ -124,6 +128,10 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
   if(humanEvaluator != NULL) {
     if(humanEvaluator->getNNXLen() != nnXLen || humanEvaluator->getNNYLen() != nnYLen)
       throw StringError("Search::init - humanEval has different nnXLen or nnYLen");
+  }
+  if(auxEvaluator != NULL) {
+    if(auxEvaluator->getNNXLen() != nnXLen || auxEvaluator->getNNYLen() != nnYLen)
+      throw StringError("Search::init - auxEval has different nnXLen or nnYLen");
   }
 
   rootKoHashTable = new KoHashTable();
@@ -370,6 +378,10 @@ void Search::setNNEval(NNEvaluator* nnEval) {
   if(humanEvaluator != NULL) {
     if(humanEvaluator->getNNXLen() != nnXLen || humanEvaluator->getNNYLen() != nnYLen)
       throw StringError("Search::setNNEval - humanEval has different nnXLen or nnYLen");
+  }
+  if(auxEvaluator != NULL) {
+    if(auxEvaluator->getNNXLen() != nnXLen || auxEvaluator->getNNYLen() != nnYLen)
+      throw StringError("Search::setNNEval - auxEval has different nnXLen or nnYLen");
   }
   applyHistoryModesToRootHistory();
 }
@@ -754,6 +766,12 @@ void Search::beginSearch(bool pondering) {
   applyVisitCapsForSearch();
 
   clearOldNNOutputs();
+
+  //Dynamic komi: recompute the virtual komi folded into the LZ-compatible inputs. If it changed,
+  //any existing tree was evaluated under a different komi, so drop it before building the new one.
+  if(updateDynamicKomi())
+    clearSearch();
+
   computeRootValues();
 
   //Prepare value bias table if we need it

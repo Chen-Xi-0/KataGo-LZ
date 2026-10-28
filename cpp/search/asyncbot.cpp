@@ -47,6 +47,16 @@ AsyncBot::AsyncBot(
   Logger* l,
   const string& randSeed
 )
+  :AsyncBot(params,nnEval,humanEval,NULL,l,randSeed)
+{}
+AsyncBot::AsyncBot(
+  const SearchParams& params,
+  NNEvaluator* nnEval,
+  NNEvaluator* humanEval,
+  NNEvaluator* auxEval,
+  Logger* l,
+  const string& randSeed
+)
   :search(NULL),
    controlMutex(),threadWaitingToSearch(),userWaitingForStop(),searchThread(),
    isRunning(false),isPondering(false),isKilled(false),shouldStopNow(false),
@@ -56,7 +66,7 @@ AsyncBot::AsyncBot(
    analyzeCallback(),
    searchBegunCallback()
 {
-  search = new Search(params,nnEval,humanEval,l,randSeed);
+  search = new Search(params,nnEval,humanEval,auxEval,l,randSeed);
   searchThread = std::thread(searchThreadLoop,this,l);
 }
 
