@@ -1041,6 +1041,7 @@ add_executable(katago
   search/timecontrols.cpp
   search/searchparams.cpp
   search/lzdynkomi.cpp
+  search/lzaux.cpp
   search/mutexpool.cpp
   search/search.cpp
   search/searchnode.cpp
