@@ -1060,6 +1060,7 @@ add_executable(katago
   search/reportedsearchvalues.cpp
   program/gtpconfig.cpp
   program/setup.cpp
+  program/lzsetup.cpp
   program/playutils.cpp
   program/playsettings.cpp
   program/play.cpp

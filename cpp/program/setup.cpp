@@ -7,58 +7,10 @@
 #include "../neuralnet/nninterface.h"
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/lzconverter.h"
+#include "../program/lzsetup.h"
 #include "../search/patternbonustable.h"
 
 using namespace std;
-
-//Sniff whether the model file is a Leela Zero text weight file. Light-weight: reads and
-//(maybe) gunzips the file once, no model construction. Used to auto-configure LZ-friendly
-//search defaults: the LZ weights are not exactly equivariant under the 8 symmetries, so
-//per-node random symmetries add noise that the search amplifies into chaotic move
-//selection (see 05_验证输出/对弈全败根因_nnRandomize噪声_20261025.md), and the
-//chosen-move temperature randomizes away the best move in genmove (analysis mode ignores
-//it, so analysis-based testing does not see it).
-bool Setup::isLZWeightFile(const string& fileName) {
-  string lower = Global::toLower(fileName);  if(Global::isSuffix(lower,".onnx") || Global::isSuffix(lower,".onnx.gz"))
-    return false;
-  try {
-    string uncompressed;
-    string sha256Buf;
-    if(Global::isSuffix(lower,".txt") || Global::isSuffix(lower,".bin"))
-      FileUtils::loadFileIntoString(fileName,"",uncompressed,&sha256Buf);
-    else if(Global::isSuffix(lower,".gz"))
-      FileUtils::uncompressAndLoadFileIntoString(fileName,"",uncompressed,&sha256Buf);
-    else
-      return false;
-    //Only plain text candidates are LZ (.bin/.bin.gz are binary KataGo floats).
-    if(Global::isSuffix(lower,".bin") || Global::isSuffix(lower,".bin.gz"))
-      return false;
-    return LZConverter::looksLikeLZ(uncompressed);
-  }
-  catch(const std::exception&) {
-    return false;
-  }
-}
-
-//LZ ladder correction v5 parameters (see nneval.h). Only effective for LZ models.
-static void loadLzLadderParams(ConfigParser& cfg) {
-  LzLadder::Params& p = LzLadder::params;
-  if(cfg.contains("lzLadderEnabled")) p.enabled = cfg.getBool("lzLadderEnabled");
-  if(cfg.contains("lzLadderMinStones")) p.minStones = cfg.getInt("lzLadderMinStones",1,361);
-  if(cfg.contains("lzLadderCheckNodes")) p.checkNodes = cfg.getInt("lzLadderCheckNodes",1,362);
-  if(cfg.contains("lzLadderMinPolicy")) p.minPolicy = cfg.getDouble("lzLadderMinPolicy",1e-9,1.0);
-  if(cfg.contains("lzLadderPolicyFactor")) p.policyFactor = cfg.getDouble("lzLadderPolicyFactor",1e-6,1.0);
-  if(cfg.contains("lzLadderPenaltyBase")) p.penaltyRank = cfg.getInt("lzLadderPenaltyBase",0,361);
-  if(cfg.contains("lzLadderChaseStones")) p.chaseStones = cfg.getInt("lzLadderChaseStones",1,361);
-  if(cfg.contains("lzLadderBoostFactor")) p.boostFactor = cfg.getDouble("lzLadderBoostFactor",1.0,100.0);
-  if(cfg.contains("lzLadderDefenseDepth")) p.defenseDepth = cfg.getInt("lzLadderDefenseDepth",1,400);
-  if(cfg.contains("lzLadderOffenseEnabled")) p.offenseEnabled = cfg.getBool("lzLadderOffenseEnabled");
-  if(cfg.contains("lzLadderOffenseDepth")) p.offenseDepth = cfg.getInt("lzLadderOffenseDepth",1,400);
-  if(cfg.contains("lzLadderBoostWinrate")) p.boostWinrate = cfg.getDouble("lzLadderBoostWinrate",0.0,10.0);
-  if(cfg.contains("lzLadderPenaltyWinrate")) p.penaltyWinrate = cfg.getDouble("lzLadderPenaltyWinrate",0.0,10.0);
-  if(cfg.contains("lzLadderMinDepth")) p.minDepth = cfg.getInt("lzLadderMinDepth",1,400);
-  if(cfg.contains("lzLadderEscapedValueBlend")) p.ladderValueBlend = cfg.getDouble("lzLadderEscapedValueBlend",0.0,1.0);
-}
 
 void Setup::initializeSession(ConfigParser& cfg) {
   (void)cfg;
@@ -153,7 +105,7 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
   testAssert(nnModelNames.size() == nnModelFiles.size());
   testAssert(expectedSha256s.size() == 0 || expectedSha256s.size() == nnModelFiles.size());
 
-  loadLzLadderParams(cfg);
+  LzSetup::loadLzLadderParams(cfg);
 
   #if defined(USE_CUDA_BACKEND)
   string backendPrefix = "cuda";
@@ -255,7 +207,7 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
     //can experiment, but an unset key now means off rather than on for LZ.
     //The chosen-move temperature is handled in the GTP layer (gtp.cpp loadParams), where
     //the genmove search params live - analysis mode ignores it by design.
-    if(!cfg.contains("nnRandomize") && setupFor != SETUP_FOR_DISTRIBUTED && isLZWeightFile(nnModelFile)) {
+    if(!cfg.contains("nnRandomize") && setupFor != SETUP_FOR_DISTRIBUTED && LzSetup::isLZWeightFile(nnModelFile)) {
       nnRandomize = false;
       logger.write("LZ weight file detected, nnRandomize disabled by default");
     }

@@ -166,10 +166,6 @@ namespace Setup {
     ConfigParser& cfg
   );
 
-  //Light-weight sniff (read + maybe gunzip + LZ text-format check, no model build):
-  //true if the model file is a Leela Zero text weight file.
-  bool isLZWeightFile(const std::string& fileName);
-
   //Return config prefixes for GPU backends.
   std::vector<std::string> getBackendPrefixes();
 
