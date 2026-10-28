@@ -1,5 +1,10 @@
 # KataGo
 
+> **Fork notice:** This is **KataGo-LZ**, a personal fork that loads Leela Zero (LZ) weights directly,
+> without retraining or offline conversion. Active development is on the `main` branch; `master` mirrors
+> upstream. See [FORK.md](FORK.md) for the feature list, build notes and limitations.
+> Upstream project: https://github.com/lightvector/KataGo
+
 - [KataGo](#katago)
   - [Overview](#overview)
   - [Training History and Research and Docs](#training-history-and-research-and-docs)
