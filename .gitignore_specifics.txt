@@ -1,0 +1,2 @@
+KataGo fork: LZ0 zero-retrain weights + aux scorer + dynamic komi + ladder correction
+Build: MinGW g++ (see 05_验证输出 for flags)
