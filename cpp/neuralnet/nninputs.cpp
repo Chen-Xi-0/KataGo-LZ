@@ -873,53 +873,6 @@ void NNInputs::iterateLadders(const Board& board, const std::function<void(Loc,c
   });
 }
 
-void NNInputs::iterateLadderGroups(
-  const Board& board,
-  const std::function<void(Loc,int,bool,const std::vector<Loc>&)>& f
-) {
-  int xSize = board.x_size;
-  int ySize = board.y_size;
-
-  Loc chainHeadsSolved[Board::MAX_PLAY_SIZE];
-  int numChainHeadsSolved = 0;
-  Board copy(board);
-  vector<Loc> buf;
-  vector<Loc> workingMoves;
-
-  for(int y = 0; y<ySize; y++) {
-    for(int x = 0; x<xSize; x++) {
-      Loc loc = Location::getLoc(x,y,xSize);
-      Color stone = board.colors[loc];
-      if(stone == P_BLACK || stone == P_WHITE) {
-        int libs = board.getNumLiberties(loc);
-        if(libs == 1 || libs == 2) {
-          Loc head = board.chain_head[loc];
-          bool alreadySolved = false;
-          for(int i = 0; i<numChainHeadsSolved; i++) {
-            if(chainHeadsSolved[i] == head) {
-              alreadySolved = true;
-              break;
-            }
-          }
-          if(alreadySolved)
-            continue;
-
-          bool captured;
-          workingMoves.clear();
-          if(libs == 1)
-            captured = copy.searchIsLadderCaptured(loc,true,buf);
-          else
-            captured = copy.searchIsLadderCapturedAttackerFirst2Libs(loc,buf,workingMoves);
-
-          chainHeadsSolved[numChainHeadsSolved] = head;
-          numChainHeadsSolved++;
-          f(loc,libs,captured,workingMoves);
-        }
-      }
-    }
-  }
-}
-
 //Currently does NOT depend on history (except for marking ko-illegal spots)
 Hash128 NNInputs::getHash(
   const Board& board, const BoardHistory& hist, Player nextPlayer,

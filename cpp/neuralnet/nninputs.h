@@ -164,16 +164,6 @@ namespace NNInputs {
   //into one, with the working moves that would capture it. Runs the same bounded ladder search
   //that fills the V3+ ladder input planes.
   void iterateLadders(const Board& board, const std::function<void(Loc,const std::vector<Loc>&)>& f);
-
-  //Invoke f once per group (deduplicated by chain head, both colors) that has 1 or 2 liberties,
-  //reporting the current liberty count and whether the bounded ladder search considers it captured.
-  //For libs == 2, workingMoves holds the attacker moves that work (the defender is the group owner,
-  //so if the group belongs to the side to move these are the moves that would kill it after the
-  //opponent's first move). For libs == 1 workingMoves is empty; the sole liberty is the capture point.
-  void iterateLadderGroups(
-    const Board& board,
-    const std::function<void(Loc,int,bool,const std::vector<Loc>&)>& f
-  );
 }
 
 struct NNOutput {
