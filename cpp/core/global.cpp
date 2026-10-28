@@ -23,22 +23,13 @@ using namespace std;
 void Global::fatalError(const char* s)
 {
   cout << "\nFATAL ERROR:\n" << s << endl;
-#if defined(_WIN32) && defined(__MINGW32__)
-  //MinGW-w64 的 msvcrt 运行库没有 quick_exit，用 _Exit 保持“不做静态析构”的语义
-  _Exit(EXIT_FAILURE);
-#else
-  quick_exit(EXIT_FAILURE);
-#endif
+quick_exit(EXIT_FAILURE);
 }
 
 void Global::fatalError(const string& s)
 {
   cout << "\nFATAL ERROR:\n" << s << endl;
-#if defined(_WIN32) && defined(__MINGW32__)
-  _Exit(EXIT_FAILURE);
-#else
-  quick_exit(EXIT_FAILURE);
-#endif
+quick_exit(EXIT_FAILURE);
 }
 
 //STRINGS---------------------------------
