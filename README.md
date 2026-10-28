@@ -4,6 +4,8 @@
 > without retraining or offline conversion. Active development is on the `main` branch; `master` mirrors
 > upstream. See [FORK.md](FORK.md) for the feature list, build notes and limitations.
 > Upstream project: https://github.com/lightvector/KataGo
+>
+> **Everything below this notice is the original upstream KataGo README, kept unchanged for reference.**
 
 - [KataGo](#katago)
   - [Overview](#overview)
