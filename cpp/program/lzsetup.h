@@ -7,6 +7,7 @@
 #define KATAGO_LZSETUP_H
 
 #include "../core/config_parser.h"
+#include "../search/searchparams.h"
 
 namespace LzSetup {
 
@@ -22,6 +23,10 @@ bool isLZWeightFile(const std::string& fileName);
 //LZ ladder correction v5 parameters (see nneval.h). Only effective for LZ models.
 //Call once at startup, before any search runs; LzLadder::params is read-only afterwards.
 void loadLzLadderParams(ConfigParser& cfg);
+
+//LZ dynamic komi knobs (useDynamicKomi, dynamicKomiMaxWr/MinWr/MidWr/TargetKomi). Same
+//startup call as loadLzLadderParams; the controller itself lives in search/lzdynkomi.cpp.
+void loadDynamicKomiParams(ConfigParser& cfg, SearchParams& params);
 
 //LZ models: zero the genmove move-selection temperature (defaults 0.1, early 0.5).
 //Analysis mode ignores these by design, so analysis-based strength testing does not

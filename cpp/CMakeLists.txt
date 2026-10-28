@@ -1040,6 +1040,7 @@ add_executable(katago
   book/bookcssjs.cpp
   search/timecontrols.cpp
   search/searchparams.cpp
+  search/lzdynkomi.cpp
   search/mutexpool.cpp
   search/search.cpp
   search/searchnode.cpp
