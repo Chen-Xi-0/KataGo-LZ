@@ -47,27 +47,7 @@ void Search::computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwner
   //solver says the attacker cannot run it down) plus the long-ladder depth floor, so short
   //escapes the net already sees do not arm it. One solver call per one-liberty chain at most,
   //done once per root evaluation instead of per node.
-  {
-    int armed = 0;
-    if(LzLadder::params.enabled && board.ko_loc == Board::NULL_LOC) {
-      for(int y = 0; y < board.y_size && armed == 0; y++) {
-        for(int x = 0; x < board.x_size; x++) {
-          Loc loc = Location::getLoc(x,y,board.x_size);
-          Loc move = Board::NULL_LOC;
-          int d = 0;
-          if(LzLadder::isRealLadderEscape(
-               board, hist, loc, pla, LzLadder::params.minStones, LzLadder::params.minDepth,
-               &move, &d)) {
-            if(getenv("LZ_LADDER_DEBUG") != NULL)
-              std::fprintf(stderr, "[LADR] armed at %s d=%d\n", Location::toString(move,board).c_str(), d);
-            armed = 1;
-            break;
-          }
-        }
-      }
-    }
-    LzLadder::rootArmed.store(armed, std::memory_order_relaxed);
-  }
+  LzLadder::armRootScan(board, hist, pla, LzLadder::rootArmed);
 }
 
 //LZ-style dynamic komi: choose a virtual komi (fed into the LZ color planes) that keeps white's

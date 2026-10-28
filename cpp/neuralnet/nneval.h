@@ -4,6 +4,7 @@
 
 #include <memory>
 
+#include "../neuralnet/lzladder.h"
 #include "../core/global.h"
 #include "../core/commontypes.h"
 #include "../core/logger.h"
@@ -67,54 +68,8 @@ struct NNResultBuf {
   NNResultBuf& operator=(const NNResultBuf& other) = delete;
 };
 
-//Parameters of the LZ ladder correction (solver verdict + policy surgery + escaped-group value
-//blend). Loaded from cfg in setup.cpp; only takes effect for LZ models (isLZModelFlag).
-namespace LzLadder {
-  struct Params {
-    bool enabled;        //lzLadderEnabled: master switch
-    int minStones;       //lzLadderMinStones: minimum chased-group size
-    int checkNodes;      //lzLadderCheckNodes: policy candidates checked for demotion
-    double minPolicy;    //lzLadderMinPolicy: candidate policy floor (probability space)
-    double policyFactor; //lzLadderPolicyFactor: demote-to factor below the penaltyRank move
-    int penaltyRank;     //lzLadderPenaltyBase: rank index the demoted move drops below
-    int chaseStones;     //lzLadderChaseStones: min ladder stones already played for chase zeroing
-    double boostFactor;  //lzLadderBoostFactor: >1 lifts a winning ladder capture above the top
-    int defenseDepth;    //lzLadderDefenseDepth: min plies of the losing line before demotion
-    bool offenseEnabled; //lzLadderOffenseEnabled: enable the futile-chase zeroing
-    int offenseDepth;    //lzLadderOffenseDepth: chase length that counts as futile
-    double boostWinrate; //lzLadderBoostWinrate: winrate nudge factor on a boosted capture
-    double penaltyWinrate;//lzLadderPenaltyWinrate: winrate nudge factor on a demoted/zeroed move
-    int minDepth;        //lzLadderMinDepth: min remaining escape depth (plies) for the value correction
-    double ladderValueBlend;//lzLadderEscapedValueBlend: blend for a solver-certified escaped group
-
-    Params();
-  };
-  extern Params params;
-  //Set by the search when the ROOT position contains a ladder-relevant shape (a group with one or
-  //two liberties whose solver verdict matters). The escaped-group value correction only runs while
-  //this is set, so ordinary searches pay nothing for it.
-  extern std::atomic<int> rootArmed;
-
-  //Shared certification of "a real ladder escape", used by the rescue boost, the root arming scan
-  //and the escaped-group value blend so all three apply the same predicate:
-  //  - the group is `pla`'s, has exactly one liberty, and at least `minStones` stones;
-  //  - its extension is the ONLY empty neighbor, reaches exactly two liberties and creates no ko;
-  //  - the solver, attacker to move, says it cannot be captured and the verdict is known
-  //    (depth > 0; the solver's node budget is upstream's fixed 25000, exhausted => 0);
-  //  - that escape is a long ladder, i.e. the remaining depth is at least `minDepth` plies.
-  //*outMove receives the extension, *outDepth the solver's escape depth.
-  bool isRealLadderEscape(
-    const Board& board, const BoardHistory& history, Loc loc, Player pla,
-    int minStones, int minDepth, Loc* outMove, int* outDepth
-  );
-
-  //Same certification for a group that already reached two liberties ("the escape already
-  //happened"). *outMove receives one of its liberties.
-  bool isEscapedTwoLibertyGroup(
-    const Board& board, Loc loc, Player pla, int minStones, int minDepth,
-    Loc* outMove, int* outDepth
-  );
-}
+//Parameters and certification predicates of the LZ ladder correction live in lzladder.h
+//(LzLadder namespace). This header keeps only the NNEvaluator wrapper declaration.
 
 // Result of NNEvaluator::benchmarkPureForward
 struct NNEvalBenchmarkResult {
