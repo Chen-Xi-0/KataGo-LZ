@@ -50,7 +50,9 @@ void Search::computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwner
   //solver says the attacker cannot run it down) plus the long-ladder depth floor, so short
   //escapes the net already sees do not arm it. One solver call per one-liberty chain at most,
   //done once per root evaluation instead of per node.
+#ifdef KATAGO_LZ_LADDER_ENABLED
   LzLadder::armRootScan(board, hist, pla, LzLadder::rootArmed);
+#endif
 }
 
 //LZ-style dynamic komi: choose a virtual komi (fed into the LZ color planes) that keeps white's
@@ -60,10 +62,14 @@ void Search::computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwner
 //updateDynamicKomi body lives in lzdynkomi.cpp (LzDynKomi::updateDynamicKomi); this
 //thin member keeps the upstream call site in beginSearch unchanged.
 bool Search::updateDynamicKomi() {
+#ifdef KATAGO_LZ_ENABLED
   return LzDynKomi::updateDynamicKomi(
     nnEvaluator, searchParams, rootBoard, rootHistory, rootPla,
     getPlayoutDoublingAdvantagePla(), logger, currentDynamicKomi, dynamicKomiSet
   );
+#else
+  return false;
+#endif
 }
 
 MiscNNInputParams Search::paramsForHumanEvaluator(const MiscNNInputParams& nnInputParams) const {
@@ -128,14 +134,23 @@ bool Search::initNodeNNOutput(
   nnInputParams.dynamicKomi = currentDynamicKomi;
   //Auxiliary evaluation uses the real (rules) komi, never the dynamic virtual komi, and a fixed
   //symmetry so score/ownership reporting is deterministic.
+#ifdef KATAGO_LZ_AUX_ENABLED
   MiscNNInputParams auxInputParams = LzAux::makeAuxInputParams(nnInputParams);
+#else
+  MiscNNInputParams auxInputParams = nnInputParams; (void)auxInputParams;
+#endif
 
   std::shared_ptr<NNOutput>* result = NULL;
   std::shared_ptr<NNOutput>* humanResult = NULL;
   std::shared_ptr<NNOutput>* auxResult = NULL;
   //Only compute the auxiliary output if we don't already have one for this node. It is used purely
   //for score/ownership reporting and must never feed back into search values.
+#ifdef KATAGO_LZ_AUX_ENABLED
   const bool needAuxOutput = auxEvaluator != NULL && (isReInit || node.getAuxOutput() == NULL);
+#else
+  const bool needAuxOutput = false;
+  (void)isReInit;
+#endif
   if(isRoot && searchParams.rootNumSymmetriesToSample > 1) {
     result = nnEvaluator->averageMultipleSymmetries(
       thread.board, thread.history, thread.pla, &searchParams.humanSLProfile,
@@ -187,7 +202,9 @@ bool Search::initNodeNNOutput(
 
   //Experimental aux value mixing: see LzAux::blendAuxValue. Policy stays the main model's;
   //only winrate/score/lead are mixed. auxValueWeight = 0 disables this.
+#ifdef KATAGO_LZ_AUX_ENABLED
   LzAux::blendAuxValue(result, auxResult, searchParams.auxValueWeight);
+#endif
 
   if(antiMirrorDifficult) {
     // Copy

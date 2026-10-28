@@ -613,6 +613,21 @@ else()
   set(_katago_auto_fetch_default OFF)
 endif()
 option(KATAGO_AUTO_FETCH_DEPS "Automatically fetch missing dependencies into <build dir>/deps (Windows/Linux use vcpkg)." ${_katago_auto_fetch_default})
+
+#LZ fork modules (Leela Zero weight support). ON for the fork's default build; a PR to upstream
+#would flip these to OFF and include only the reviewed subset. KATAGO_LZ covers the converter,
+#V8 inputs and backend support; the ladder correction and the aux evaluator are independently
+#gated so each can be reviewed/merged on its own. V8 input constants are NOT gated (they are
+#compile-time globals that trainingwrite/tests assert on).
+option(KATAGO_LZ "Include Leela Zero weight support (converter, V8 inputs, backends)." ON)
+option(KATAGO_LZ_LADDER "Include the LZ ladder correction (requires KATAGO_LZ)." ON)
+option(KATAGO_LZ_AUX "Include the experimental aux score/ownership evaluator (requires KATAGO_LZ)." ON)
+if(KATAGO_LZ_LADDER AND NOT KATAGO_LZ)
+  message(FATAL_ERROR "KATAGO_LZ_LADDER=ON requires KATAGO_LZ=ON")
+endif()
+if(KATAGO_LZ_AUX AND NOT KATAGO_LZ)
+  message(FATAL_ERROR "KATAGO_LZ_AUX=ON requires KATAGO_LZ=ON")
+endif()
 # Inside the build directory (NOT the source tree), so configure never writes into a checkout and
 # separate build directories can't race on a shared vcpkg clone. Override to a common location if
 # you want fetched deps shared across build dirs.
@@ -1031,8 +1046,8 @@ add_executable(katago
   neuralnet/modelversion.cpp
   neuralnet/nneval.cpp
   neuralnet/desc.cpp
-  neuralnet/lzconverter.cpp
-  neuralnet/lzladder.cpp
+  $<$<BOOL:${KATAGO_LZ}>:neuralnet/lzconverter.cpp>
+  $<$<BOOL:${KATAGO_LZ_LADDER}>:neuralnet/lzladder.cpp>
   neuralnet/lzinputs.cpp
   neuralnet/debugprint.cpp
   ${NEURALNET_BACKEND_SOURCES}
@@ -1040,8 +1055,8 @@ add_executable(katago
   book/bookcssjs.cpp
   search/timecontrols.cpp
   search/searchparams.cpp
-  search/lzdynkomi.cpp
-  search/lzaux.cpp
+  $<$<BOOL:${KATAGO_LZ}>:search/lzdynkomi.cpp>
+  $<$<BOOL:${KATAGO_LZ_AUX}>:search/lzaux.cpp>
   search/mutexpool.cpp
   search/search.cpp
   search/searchnode.cpp
@@ -1064,7 +1079,7 @@ add_executable(katago
   search/reportedsearchvalues.cpp
   program/gtpconfig.cpp
   program/setup.cpp
-  program/lzsetup.cpp
+  $<$<BOOL:${KATAGO_LZ}>:program/lzsetup.cpp>
   program/playutils.cpp
   program/playsettings.cpp
   program/play.cpp
@@ -1122,6 +1137,18 @@ add_executable(katago
   command/writetrainingdata.cpp
   main.cpp
   )
+
+#LZ fork feature switches as compile definitions (backend-agnostic).
+if(KATAGO_LZ)
+  target_compile_definitions(katago PRIVATE KATAGO_LZ_ENABLED)
+endif()
+if(KATAGO_LZ_LADDER)
+  target_compile_definitions(katago PRIVATE KATAGO_LZ_LADDER_ENABLED)
+endif()
+if(KATAGO_LZ_AUX)
+  target_compile_definitions(katago PRIVATE KATAGO_LZ_AUX_ENABLED)
+endif()
+
 
 if(USE_BACKEND STREQUAL "CUDA")
   target_compile_definitions(katago PRIVATE USE_CUDA_BACKEND)

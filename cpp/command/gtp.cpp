@@ -2182,10 +2182,12 @@ int MainCmds::gtp(const vector<string>& args) {
 
     //LZ models: zero the genmove move-selection temperature (defaults 0.1, early 0.5).
     //See LzSetup::applyLzGenmoveTemperatureDefaults for the full rationale.
+#ifdef KATAGO_LZ_ENABLED
     LzSetup::applyLzGenmoveTemperatureDefaults(
       config,nnModelFile,
       genmoveOut.chosenMoveTemperature,genmoveOut.chosenMoveTemperatureEarly
     );
+#endif
 
     genmoveOut.antiMirror = genmoveAntiMirror;
     analysisOut.wideRootNoise = analysisWideRootNoise;

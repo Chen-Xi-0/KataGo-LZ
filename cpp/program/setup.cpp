@@ -105,7 +105,9 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
   testAssert(nnModelNames.size() == nnModelFiles.size());
   testAssert(expectedSha256s.size() == 0 || expectedSha256s.size() == nnModelFiles.size());
 
+#ifdef KATAGO_LZ_LADDER_ENABLED
   LzSetup::loadLzLadderParams(cfg);
+#endif
 
   #if defined(USE_CUDA_BACKEND)
   string backendPrefix = "cuda";
@@ -207,10 +209,12 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
     //can experiment, but an unset key now means off rather than on for LZ.
     //The chosen-move temperature is handled in the GTP layer (gtp.cpp loadParams), where
     //the genmove search params live - analysis mode ignores it by design.
+#ifdef KATAGO_LZ_ENABLED
     if(!cfg.contains("nnRandomize") && setupFor != SETUP_FOR_DISTRIBUTED && LzSetup::isLZWeightFile(nnModelFile)) {
       nnRandomize = false;
       logger.write("LZ weight file detected, nnRandomize disabled by default");
     }
+#endif
 
     string nnRandSeed;
     if(setupFor == SETUP_FOR_DISTRIBUTED)
@@ -793,7 +797,9 @@ vector<SearchParams> Setup::loadParams(
     else if(cfg.contains("antiMirror"))   params.antiMirror = cfg.getBool("antiMirror");
     else                                  params.antiMirror = false;
 
+#ifdef KATAGO_LZ_ENABLED
     LzSetup::loadDynamicKomiParams(cfg,params);
+#endif
 
     if(cfg.contains("ignorePreRootHistory"+idxStr)) params.ignorePreRootHistory = cfg.getBool("ignorePreRootHistory"+idxStr);
     else if(cfg.contains("ignorePreRootHistory"))   params.ignorePreRootHistory = cfg.getBool("ignorePreRootHistory");

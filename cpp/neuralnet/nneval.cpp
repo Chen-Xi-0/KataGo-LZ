@@ -1285,8 +1285,10 @@ void NNEvaluator::evaluate(
     //(before the softmax, legality mask in place). The value override happens one level up in
     //evaluateWithLzLadder. Native KataGo nets unaffected.
     //LZ_NO_LADDER=1 skips it entirely (A/B experiment switch for strength testing).
+#ifdef KATAGO_LZ_LADDER_ENABLED
     if(isLZModelFlag && LzLadder::params.enabled && getenv("LZ_NO_LADDER") == NULL)
       applyLZLadderCorrectionV5(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal,&ladderWinMul);
+#endif
 
     //The correction can change which logit is the largest, so recompute the softmax reference.
     maxPolicy = -1e25f;
@@ -1604,6 +1606,13 @@ void NNEvaluator::evaluateWithLzLadder(
 ) {
   evaluate(board, history, nextPlayer, sgfMeta, nnInputParams, buf, skipCache, includeOwnerMap);
 
+#ifndef KATAGO_LZ_LADDER_ENABLED
+  (void)board;(void)history;(void)nextPlayer;(void)sgfMeta;
+#endif
+#ifndef KATAGO_LZ_LADDER_ENABLED
+  return;
+#else
+
   //Value half of the ladder correction, gated to the exact state where it matters: the opponent
   //(the side that is NOT to move) has a group with exactly two liberties and the depth solver -
   //with US moving first - says it cannot be run down. That is precisely "their escape already
@@ -1667,6 +1676,7 @@ void NNEvaluator::evaluateWithLzLadder(
       }
     }
   }
+#endif //KATAGO_LZ_LADDER_ENABLED
 }
 // Uncomment this to lower the effective hash size down to one where we get true collisions
 // #define SIMULATE_TRUE_HASH_COLLISIONS

@@ -9,7 +9,9 @@
 #include "../neuralnet/modelversion.h"
 #include "../neuralnet/sgfmetadata.h"
 #include "../neuralnet/nninterface.h"
+#ifdef KATAGO_LZ_ENABLED
 #include "../neuralnet/lzconverter.h"
+#endif
 
 #include "../core/test.h"
 
@@ -2999,9 +3001,15 @@ void ModelDesc::loadFromFileMaybeGZipped(const string& fileName, ModelDesc& desc
       string uncompressed;
       string sha256Buf;
       FileUtils::loadFileIntoString(fileName,expectedSha256,uncompressed,&sha256Buf);
-      if(LZConverter::looksLikeLZ(uncompressed)) {
+      bool looksLZ = false;
+#ifdef KATAGO_LZ_ENABLED
+      looksLZ = LZConverter::looksLikeLZ(uncompressed);
+#endif
+      if(looksLZ) {
+#ifdef KATAGO_LZ_ENABLED
         descBuf = ModelDesc();
         LZConverter::buildModelDesc(uncompressed,sha256Buf,descBuf);
+#endif
       }
       else {
         NonCopyingStreamBuf uncompressedStreamBuf(uncompressed);
@@ -3025,9 +3033,15 @@ void ModelDesc::loadFromFileMaybeGZipped(const string& fileName, ModelDesc& desc
 
       //Leela Zero / ELF text weights are converted in-memory instead of going through the
       //KataGo model parser. Only plain text candidates are sniffed (.bin.gz is binary floats).
-      if(!Global::isSuffix(lower,".bin.gz") && LZConverter::looksLikeLZ(uncompressed)) {
+      bool looksLZ = false;
+#ifdef KATAGO_LZ_ENABLED
+      looksLZ = !Global::isSuffix(lower,".bin.gz") && LZConverter::looksLikeLZ(uncompressed);
+#endif
+      if(looksLZ) {
+#ifdef KATAGO_LZ_ENABLED
         descBuf = ModelDesc();
         LZConverter::buildModelDesc(uncompressed,sha256Buf,descBuf);
+#endif
       }
       else {
         bool binaryFloats = !Global::isSuffix(lower,".txt.gz");
