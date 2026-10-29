@@ -4159,10 +4159,7 @@ struct PolicyHead {
     gpoolToPassMul2(cudaHandles,&desc->gpoolToPassMul2,false)
   {
     if(hasFullPolicyMul) {
-      //pFullMul consumes the flattened spatial p1Activation output. desc's weights are laid out for
-      //position-major channel-minor order (pos*p1Channels+c, what NHWC buffers give), so under the
-      //NCHW layout (channel-major, c*numSpatial+pos) the weights are permuted below instead of
-      //forcing NHWC - on pre-Volta GPUs FP32+NCHW is the fast cudnn path.
+      //desc weights are position-major; permute for NCHW instead of forcing NHWC.
       const int numSpatial = nnX * nnY;
       const int poc = p2Channels;
       const int fullOut = desc->pFullMul.outChannels;
@@ -4495,9 +4492,7 @@ struct ValueHead {
     v1BN.apply(cudaHandles,batchSize,v1Out.buf,maskBuf,v1Out2.buf);
 
     if(hasFullValueMul) {
-      //Leela-Zero-style value head: flatten v1Activation and feed it straight to v2Mul, skipping
-      //the global pooling statistics. LZ nets have v1Conv.outChannels == 1, so the activation
-      //block is already the position-major vector v2Mul expects regardless of NHWC/NCHW.
+      //LZ value head: flatten v1Activation straight into v2Mul.
       void* v1FlatBuf = v1Out2.buf;
       if(usingFP16) {
         customCudaCopyFromHalf((const half*)v1Out2.buf,(float*)workspaceBuf,batchSize*v1Channels*nnXLen*nnYLen,cudaHandles->stream);
@@ -5279,11 +5274,7 @@ ComputeHandle* NeuralNet::createComputeHandle(
     useNHWC = true;
   }
 
-  //LZ-style models (LZConverter) use full spatial matmuls for the policy and value heads. Those
-  //are handled under either layout: the policy head permutes pFullMul's input dimension when NCHW
-  //(see PolicyHead), and the value head's v1Conv has a single output channel so both flattenings
-  //coincide. So unlike transformer models, LZ models do NOT need NHWC forced here - keeping NCHW
-  //lets pre-Volta GPUs use the FP32 NCHW cudnn path, which is much faster than FP32 NHWC there.
+  //LZ models keep the default layout (NCHW is faster where supported).
 
   if(logger != NULL) {
     logger->write(

@@ -767,8 +767,7 @@ void Search::beginSearch(bool pondering) {
 
   clearOldNNOutputs();
 
-  //Dynamic komi: recompute the virtual komi folded into the LZ-compatible inputs. If it changed,
-  //any existing tree was evaluated under a different komi, so drop it before building the new one.
+  //Dynamic komi may have changed; drop the tree if it did.
   if(updateDynamicKomi())
     clearSearch();
 

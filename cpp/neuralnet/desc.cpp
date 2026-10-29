@@ -666,9 +666,7 @@ int64_t ResidualBlockDesc::getNumParameters() const {
 }
 
 void ResidualBlockDesc::transformToReduceActivations() {
-  // Postnorm blocks carry weights folded from Leela Zero batch norms; keep them exactly as
-  // written so that inference replays the original network bit-for-bit (this transform is a
-  // pure optimization and skipping it is semantically neutral).
+  //Postnorm blocks carry weights folded from LZ batch norms; keep them bit-exact.
   if(hasPostNorm)
     return;
   // Merge in any multiplications by values less than 1.0 to happen earlier.
@@ -993,9 +991,7 @@ static bool blocksContainTransformer(const std::vector<std::pair<int, unique_ptr
   return false;
 }
 
-//True if the block stack contains any postnorm block, at any nesting depth. The per-channel
-//scaling transforms below are not valid across a postnorm block's post-residual batch norm
-//(its bias term is not invariant to the flow scaling), so callers must skip them.
+//The per-channel scaling transforms below are invalid across a postnorm block.
 static bool blocksContainPostnormRecursive(const std::vector<std::pair<int, unique_ptr_void>>& blocks) {
   for(size_t i = 0; i < blocks.size(); i++) {
     if(blocks[i].first == POSTNORM_BLOCK_KIND)
@@ -2161,11 +2157,7 @@ PolicyHeadDesc::PolicyHeadDesc(istream& in, int vrsn, bool binaryFloats) {
     if(in.fail())
       throw StringError(name + ": policy head failed to parse policyOutChannels");
     // version 17 supports q value predictions based on whether channels are 2 (optimistic policy only) or 4 (optimistic policy + q winloss and score)
-    // Leela-Zero-style heads additionally allow 1 for plain single-channel policies, because they
-    // carry the policy through a full matmul instead of the conv+gpool path. That case only arises
-    // from the in-memory LZ converter (which never reaches this parser) and is gated on the
-    // explicit LZ marker rather than a version number, so a future upstream version 18 keeps its
-    // own semantics and never gets misread as an LZ net.
+    //Leela-Zero-style heads may use a single-channel policy (converter-built only).
     if(policyOutChannels == 1) {
       //Reserved for Leela-Zero-style heads built by LZConverter; upstream nets do not use it.
       throw StringError(name + ": policy head got invalid policyOutChannels 1 (only Leela-Zero-converted heads may use single-channel policies)");

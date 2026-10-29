@@ -1,7 +1,4 @@
-//LZ-compatible (model version 18) input plane filling, split out of neuralnet/nninputs.cpp so
-//the upstream file keeps only a one-line dispatcher (see 05_验证输出/LZ分支代码解耦重构设计_20261028.md §4).
-//The implementation stays as NNInputs::fillRowV8 - the declaration lives in nninputs.h next to
-//the other input versions and every call site (nneval, trainingwrite) is unchanged.
+//V8 (LZ-compatible) input plane filling: implementation of NNInputs::fillRowV8.
 
 #include "../neuralnet/nninputs.h"
 
@@ -10,8 +7,7 @@
 
 using namespace std;
 
-//File-local helper duplicated from nninputs.cpp (the V8 fill is the only lzinputs code that
-//needs it; keeping both copies static avoids touching upstream nninputs.cpp further).
+//Local copy of the helper in nninputs.cpp.
 static void setRowBin(float* rowBin, int pos, int feature, float value, int posStride, int featureStride) {
   rowBin[pos * posStride + feature * featureStride] = value;
 }
@@ -46,8 +42,7 @@ void NNInputs::fillRowV8(
   Player pla = nextPlayer;
   Player opp = getOpp(pla);
 
-  //Feature 0 - on board. This plane doubles as the backend mask (Model::apply takes
-  //mask = input channel 0), so it must be exactly 1.0 on board and 0.0 off board.
+  //Feature 0: on-board plane, doubles as the backend mask.
   for(int y = 0; y<ySize; y++) {
     for(int x = 0; x<xSize; x++) {
       int pos = NNPos::xyToPos(x,y,nnXLen);
@@ -55,20 +50,10 @@ void NNInputs::fillRowV8(
     }
   }
 
-  //Features 1-8: the player to move's stones, h = 0 (most recent) .. 7
-  //Features 9-16: the opponent's stones, h = 0 .. 7
-  //LZ semantics (gather_features): moves = min(movenum+1, 8), and planes for h >= moves
-  //stay zero. KataGo's recentBoards ring returns copies of the *starting board* beyond
-  //the available history, which differs from LZ's zero-fill whenever the start position
-  //has setup stones, so explicitly zero-fill instead of relying on getRecentBoard.
-  //
-  //Coordinate direction: KataGo's board y runs top-to-bottom (GTP row r <-> internal
-  //y = y_size - r, see Location::tryOfString / Board::printBoard), while the
-  //Leela-Zero plane layout indexes positions bottom-to-top: idx = y_b * 19 + x with
-  //y_b = GTP row - 1. Writing each board point (x,y) at NN position (x, y_size-1-y)
-  //makes the tensor consumed by the backend equal the LZ input planes exactly.
-  //(The policy head's pFullMul output rows are correspondingly y-flipped in the
-  //converted model file, so logits land on the correct GTP vertices.)
+  //Features 1-8: stones of the player to move, h=0 (most recent)..7; 9-16: opponent.
+  //Planes beyond the available history are zero-filled (LZ's gather_features).
+  //KataGo y runs top-to-bottom while LZ planes index bottom-to-top, so board point (x,y)
+  //is written at NN position (x, y_size-1-y); converted policy rows are y-flipped to match.
   int numMoves = std::min<int>((int)hist.moveHistory.size() + 1, 8);
   for(int h = 0; h<8; h++) {
     if(h >= numMoves)
@@ -87,11 +72,8 @@ void NNInputs::fillRowV8(
     }
   }
 
-  //Features 17,18 - color planes, matching LZ's gather_features: LZ plane 16 is the
-  //all-ones plane iff black is to move, LZ plane 17 iff white is to move.
-  //With dynamic komi, follow LZ's "dynamic color planes": encode a virtual komi K as
-  //plus = 0.5 + K/15 on the plane of the side that gives komi and minus = 0.5 - K/15
-  //on the other, so K = 7.5 reproduces the usual 1/0 and K = 0 means no komi.
+  //Features 17-18: LZ color planes. With dynamic komi, encode virtual komi K as
+  //0.5 +/- K/15 so K=7.5 reproduces the usual 1/0.
   {
     float blackPlane = 1.0f;
     float whitePlane = 0.0f;

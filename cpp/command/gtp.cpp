@@ -1157,9 +1157,7 @@ struct GTPEngine {
         NAN;
       testAssert(!std::isnan(desiredDynamicPDA));
 
-      //On LZ-compatible (V8) models playoutDoublingAdvantage is not a network input and is instead
-      //mapped to the dynamic virtual komi inside Search. There, a value explicitly set by the user
-      //or GUI should take precedence over the automatically computed one.
+      //LZ models: an explicit PDA takes precedence over the automatic one.
       if(nnEval != NULL && nnEval->isLZModel() && paramsToUse.playoutDoublingAdvantage != 0.0)
         desiredDynamicPDA = paramsToUse.playoutDoublingAdvantage;
 
@@ -1698,8 +1696,7 @@ struct GTPEngine {
 
         NNOutput* nnOutput = buf.result.get();
         out << "symmetry " << symmetry << endl;
-        // NOTE(lz-mv18 verification build): %.9g instead of %.6f for float32-lossless
-        // GTP output, so that cross-engine comparisons can be made at < 1e-6 tolerance.
+        //%.9g keeps float32-lossless output.
         out << "whiteWin " << Global::strprintf("%.9g",nnOutput->whiteWinProb) << endl;
         out << "whiteLoss " << Global::strprintf("%.9g",nnOutput->whiteLossProb) << endl;
         out << "noResult " << Global::strprintf("%.9g",nnOutput->whiteNoResultProb) << endl;
@@ -2180,8 +2177,7 @@ int MainCmds::gtp(const vector<string>& args) {
     genmoveOut = params;
     analysisOut = params;
 
-    //LZ models: zero the genmove move-selection temperature (defaults 0.1, early 0.5).
-    //See LzSetup::applyLzGenmoveTemperatureDefaults for the full rationale.
+    //LZ models: no genmove temperature sampling.
 #ifdef KATAGO_LZ_ENABLED
     LzSetup::applyLzGenmoveTemperatureDefaults(
       config,nnModelFile,

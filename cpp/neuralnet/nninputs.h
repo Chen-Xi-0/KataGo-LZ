@@ -111,13 +111,9 @@ namespace NNInputs {
   const int NUM_FEATURES_SPATIAL_V7 = 22;
   const int NUM_FEATURES_GLOBAL_V7 = 19;
 
-  //V8 - LZ-compatible inputs (model version 18), 19x19 only:
-  //  channel 0  = on-board all-ones plane (also serves as the backend mask)
-  //  channels 1-8  = current player's stones, history h=0 (most recent) .. 7
-  //  channels 9-16 = opponent's stones, history h=0 .. 7
-  //  channel 17 = all ones if black to move, else zeros (LZ color plane 16)
-  //  channel 18 = all ones if white to move, else zeros (LZ color plane 17)
-  //Missing history (fewer than 8 moves played) is zero-filled, matching LZ's gather_features.
+  //V8 - LZ-compatible inputs (model version 18), 19x19 only: channel 0 = on-board mask,
+  //1-8 = current player's stones (h=0..7), 9-16 = opponent's stones, 17/18 = color planes.
+  //Missing history is zero-filled.
   const int NUM_FEATURES_SPATIAL_V8 = 19;
   const int NUM_FEATURES_GLOBAL_V8 = 1;
 

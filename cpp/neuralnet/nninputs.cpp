@@ -2761,5 +2761,4 @@ void NNInputs::fillRowV7(
 
 }
 
-//fillRowV8 body lives in lzinputs.cpp (LzInputs::fillRowV8); this dispatcher
-//keeps the upstream call sites unchanged.
+//fillRowV8 body lives in lzinputs.cpp.

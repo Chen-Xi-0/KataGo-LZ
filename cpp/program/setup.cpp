@@ -204,11 +204,7 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
       setupFor == SETUP_FOR_DISTRIBUTED ? true :
       cfg.contains("nnRandomize") ? cfg.getBool("nnRandomize") :
       true;
-    //LZ models: default nnRandomize off (weights are not symmetry-equivariant; random
-    //per-node symmetries poison the search). An explicit cfg value still wins, so users
-    //can experiment, but an unset key now means off rather than on for LZ.
-    //The chosen-move temperature is handled in the GTP layer (gtp.cpp loadParams), where
-    //the genmove search params live - analysis mode ignores it by design.
+    //LZ models: default nnRandomize off (weights are not symmetry-equivariant).
 #ifdef KATAGO_LZ_ENABLED
     if(!cfg.contains("nnRandomize") && setupFor != SETUP_FOR_DISTRIBUTED && LzSetup::isLZWeightFile(nnModelFile)) {
       nnRandomize = false;

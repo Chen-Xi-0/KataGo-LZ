@@ -1111,11 +1111,7 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
   return new std::shared_ptr<NNOutput>(new NNOutput(ptrs));
 }
 
-//-------------------------------------------------------------------------------------
-//LZ0 ladder correction v5 lives in lzladder.cpp (LzLadder namespace + predicates + policy
-//surgery). This file keeps only the hooks: the policy-surgery call in evaluate()'s
-//postprocessing, the ladderWinMul value nudge after value postprocessing, and the
-//evaluateWithLzLadder() wrapper for the escaped-group value blend.
+//Ladder hooks only; the correction itself lives in lzladder.cpp.
 
 void NNEvaluator::evaluate(
   const Board& board,
@@ -1281,10 +1277,7 @@ void NNEvaluator::evaluate(
 
     testAssert(legalCount > 0);
 
-    //LZ0 ladder correction v5, policy part: solver-verdict demotions on the scaled logits
-    //(before the softmax, legality mask in place). The value override happens one level up in
-    //evaluateWithLzLadder. Native KataGo nets unaffected.
-    //LZ_NO_LADDER=1 skips it entirely (A/B experiment switch for strength testing).
+    //Ladder policy surgery; LZ_NO_LADDER=1 disables it.
 #ifdef KATAGO_LZ_LADDER_ENABLED
     if(isLZModelFlag && LzLadder::params.enabled && getenv("LZ_NO_LADDER") == NULL)
       applyLZLadderCorrectionV5(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal,&ladderWinMul);

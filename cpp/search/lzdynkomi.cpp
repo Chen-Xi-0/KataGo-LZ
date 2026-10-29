@@ -32,8 +32,7 @@ bool updateDynamicKomi(
   const float minWr = searchParams.dynamicKomiMinWr;
   const float maxWr = searchParams.dynamicKomiMaxWr;
 
-  //Evaluate white's winrate at a trial virtual komi. skipCache=true so tuning probes never
-  //populate the nn cache; symmetry 0 keeps the tuning deterministic.
+  //Trial eval: skip the cache and use symmetry 0.
   auto whiteWinrateAtKomi = [&](float komi) -> float {
     MiscNNInputParams nnInputParams;
     nnInputParams.drawEquivalentWinsForWhite = searchParams.drawEquivalentWinsForWhite;
@@ -61,8 +60,7 @@ bool updateDynamicKomi(
     return buf.result->whiteWinProb;
   };
 
-  //White winrate increases monotonically with komi, so bisect between a komi that is winning
-  //for white (high) and one that is losing (low), returning the losing side as LZ does.
+  //Bisect between a winning and a losing komi; return the losing side.
   auto binarySearchKomi = [&](float high, float low, float target) -> float {
     for(int i = 0; i<8; i++) {
       float k = (high + low) / 2.0f;
@@ -74,9 +72,7 @@ bool updateDynamicKomi(
     return low;
   };
 
-  //KataGo's playoutDoublingAdvantage is inert on V8 inputs, so reuse it as a signed aggression
-  //knob and map it linearly into the virtual komi carried by the color planes. Positive means the
-  //root player is assumed stronger and should see less komi (and hence play more actively).
+  //PDA is inert on V8 inputs; map it linearly to a virtual komi (positive = stronger).
   if(searchParams.playoutDoublingAdvantage != 0) {
     const double pda = searchParams.playoutDoublingAdvantage;
     const Player pdaPlaArg = pdaPla;
@@ -86,12 +82,7 @@ bool updateDynamicKomi(
     if(newKomi < 0.0f) newKomi = 0.0f;
     if(newKomi > 15.0f) newKomi = 15.0f;
 
-    //Rescue floor. Native KataGo happily plays at extremely low reported winrates (its own
-    //auto-PDA handicap games report ~0.05%), so this is not a general "don't be desperate"
-    //floor. It only guards the point where the V8 net actually degenerates: in a 4-stone
-    //handicap game it starts passing around 0.5% white winrate, while ~0.8% and above still
-    //plays normally. Raise K just enough to clear the floor (and stay within [0,15], the domain
-    //the color planes were built for), keeping the PDA effect intact wherever possible.
+    //Rescue floor: raise K just enough that the net does not degenerate (~0.5% winrate).
     const float rescueFloor = 0.02f;
     if(newKomi < rootHistory.rules.komi && whiteWinrateAtKomi(newKomi) < rescueFloor) {
       const float maxKomi = 15.0f;

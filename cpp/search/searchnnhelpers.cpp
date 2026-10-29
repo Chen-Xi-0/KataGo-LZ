@@ -44,23 +44,13 @@ void Search::computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwner
     nnResultBuf, skipCache, includeOwnerMap
   );
 
-  //Arm or disarm the LZ escaped-group value correction for this search: it may only run when the
-  //ROOT position contains a long ladder the side to move can really escape. Same predicate as the
-  //rescue boost (own one-liberty group, only liberty extends to exactly two liberties, no ko,
-  //solver says the attacker cannot run it down) plus the long-ladder depth floor, so short
-  //escapes the net already sees do not arm it. One solver call per one-liberty chain at most,
-  //done once per root evaluation instead of per node.
+  //Arm the escaped-group value correction if the root has an escapable long ladder.
 #ifdef KATAGO_LZ_LADDER_ENABLED
   LzLadder::armRootScan(board, hist, pla, LzLadder::rootArmed);
 #endif
 }
 
-//LZ-style dynamic komi: choose a virtual komi (fed into the LZ color planes) that keeps white's
-//winrate within [dynamicKomiMinWr, dynamicKomiMaxWr], targeting dynamicKomiMidWr. This mirrors
-//the handicap/endgame "auto adjust komi" logic from the Leela Zero fork: only the nn input is
-//changed, the real rules komi is untouched. Returns true iff the stored virtual komi changed.
-//updateDynamicKomi body lives in lzdynkomi.cpp (LzDynKomi::updateDynamicKomi); this
-//thin member keeps the upstream call site in beginSearch unchanged.
+//Delegate to lzdynkomi.cpp.
 bool Search::updateDynamicKomi() {
 #ifdef KATAGO_LZ_ENABLED
   return LzDynKomi::updateDynamicKomi(
