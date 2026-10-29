@@ -70,8 +70,7 @@ struct BoardHistory {
   //this history object rather than per-game state, set only via setModes.
   BoardHistoryModes modes;
 
-  //LZ-compatible models (mv18, inputs version 8) need 8 boards of history
-  //(LZ networks use input_moves = 8 planes of stone history per player).
+  //LZ-compatible models (inputs version 8) need 8 boards.
   static const int NUM_RECENT_BOARDS = 8;
   Board recentBoards[NUM_RECENT_BOARDS];
   int currentRecentBoardIdx;

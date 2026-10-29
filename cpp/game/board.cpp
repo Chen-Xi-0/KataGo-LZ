@@ -1661,8 +1661,7 @@ bool Board::searchIsLadderCaptured(Loc loc, bool defenderFirst, vector<Loc>& buf
   int stackIdx = 0;
   int searchNodeCount = 0;
   static const int MAX_LADDER_SEARCH_NODE_BUDGET = 25000;
-  //Depth bookkeeping, mirroring the reference fork's LadderDetection: record how deep the
-  //conclusions were reached, separately for the escape and the capture verdicts.
+  //How deep each verdict was reached (escape vs capture).
   int aliveDepth = 0;
   int deadDepth = 0;
 
