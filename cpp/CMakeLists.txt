@@ -614,14 +614,10 @@ else()
 endif()
 option(KATAGO_AUTO_FETCH_DEPS "Automatically fetch missing dependencies into <build dir>/deps (Windows/Linux use vcpkg)." ${_katago_auto_fetch_default})
 
-#LZ fork modules (Leela Zero weight support). ON for the fork's default build; a PR to upstream
-#would flip these to OFF and include only the reviewed subset. KATAGO_LZ covers the converter,
-#V8 inputs and backend support; the ladder correction and the aux evaluator are independently
-#gated so each can be reviewed/merged on its own. V8 input constants are NOT gated (they are
-#compile-time globals that trainingwrite/tests assert on).
+#LZ fork modules. V8 input constants are not gated (compile-time globals asserted elsewhere).
 option(KATAGO_LZ "Include Leela Zero weight support (converter, V8 inputs, backends)." ON)
 option(KATAGO_LZ_LADDER "Include the LZ ladder correction (requires KATAGO_LZ)." ON)
-option(KATAGO_LZ_AUX "Include the experimental aux score/ownership evaluator (requires KATAGO_LZ)." ON)
+option(KATAGO_LZ_AUX "Include the aux score/ownership evaluator (requires KATAGO_LZ)." ON)
 if(KATAGO_LZ_LADDER AND NOT KATAGO_LZ)
   message(FATAL_ERROR "KATAGO_LZ_LADDER=ON requires KATAGO_LZ=ON")
 endif()
