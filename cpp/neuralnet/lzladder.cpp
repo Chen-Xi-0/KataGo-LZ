@@ -141,7 +141,7 @@ namespace LzLadder {
           if(isRealLadderEscape(
                board, hist, loc, pla, params.minStones, params.minDepth,
                &move, &d)) {
-            if(getenv("LZ_LADDER_DEBUG") != NULL)
+            if(debugEnvSet())
               std::fprintf(stderr, "[LADR] armed at %s d=%d\n", Location::toString(move,board).c_str(), d);
             armed = 1;
             break;

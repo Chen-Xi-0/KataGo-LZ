@@ -38,6 +38,17 @@ namespace LzLadder {
   //Set while the root position has a ladder-relevant shape.
   extern std::atomic<int> rootArmed;
 
+  //Env flags are process-lifetime constants; read them once at first use instead of doing
+  //a string lookup on every NN evaluation.
+  inline bool noLadderEnvSet() {
+    static const bool v = std::getenv("LZ_NO_LADDER") != NULL;
+    return v;
+  }
+  inline bool debugEnvSet() {
+    static const bool v = std::getenv("LZ_LADDER_DEBUG") != NULL;
+    return v;
+  }
+
   //Real ladder escape: own one-liberty group, only liberty extends to exactly two liberties
   //without ko, solver says it cannot be captured, and the escape is at least minDepth deep.
   bool isRealLadderEscape(

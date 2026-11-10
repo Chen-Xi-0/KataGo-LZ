@@ -1279,7 +1279,7 @@ void NNEvaluator::evaluate(
 
     //Ladder policy surgery; LZ_NO_LADDER=1 disables it.
 #ifdef KATAGO_LZ_LADDER_ENABLED
-    if(isLZModelFlag && LzLadder::params.enabled && getenv("LZ_NO_LADDER") == NULL)
+    if(isLZModelFlag && LzLadder::params.enabled && !LzLadder::noLadderEnvSet())
       applyLZLadderCorrectionV5(board,history,nextPlayer,nnXLen,nnYLen,policy,isLegal,&ladderWinMul);
 #endif
 
@@ -1616,7 +1616,7 @@ void NNEvaluator::evaluateWithLzLadder(
   //evaluate that, so the node value reflects a live group. Only LONG ladders qualify (remaining
   //escape depth >= lzLadderMinDepth): a short escape reaches three liberties within a move or two
   //and the value head already sees it.
-  if(!isLZModelFlag || !LzLadder::params.enabled || getenv("LZ_NO_LADDER") != NULL)
+  if(!isLZModelFlag || !LzLadder::params.enabled || LzLadder::noLadderEnvSet())
     return;
   if(buf.result == NULL)
     return;
@@ -1657,7 +1657,7 @@ void NNEvaluator::evaluateWithLzLadder(
           const float dEnd = endBuf.result->whiteWinProb;
           const float blend = (float)P.ladderValueBlend;
           const float blended = (1.0f - blend) * buf.result->whiteWinProb + blend * dEnd;
-          if(getenv("LZ_LADDER_DEBUG") != NULL)
+          if(LzLadder::debugEnvSet())
             std::fprintf(stderr, "[LADVE] escaped-group d=%d size=%d raw=%.4f end=%.4f -> %.4f\n",
               d, chainSize, buf.result->whiteWinProb, dEnd, blended);
           buf.result->whiteWinProb = blended;
