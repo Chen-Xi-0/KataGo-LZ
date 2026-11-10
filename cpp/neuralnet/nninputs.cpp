@@ -1,5 +1,7 @@
 #include "../neuralnet/nninputs.h"
 
+#include <cstring>
+
 #include "../core/test.h"
 
 using namespace std;
@@ -529,6 +531,13 @@ void NNOutput::debugPrint(ostream& out, const Board& board) const {
 //-------------------------------------------------------------------------------------------------------------
 
 static void copyWithSymmetry(const float* src, float* dst, int nSize, int hSize, int wSize, int cSize, bool useNHWC, int symmetry, bool reverse) {
+  //Symmetry 0 is the identity transform for both layouts and both directions (the flip
+  //and transpose offsets below all degenerate to a straight pass-through), so a flat
+  //memcpy replaces the per-element scatter.
+  if(symmetry == 0) {
+    std::memcpy(dst, src, sizeof(float) * (size_t)nSize * (size_t)hSize * (size_t)wSize * (size_t)cSize);
+    return;
+  }
   bool transpose = (symmetry & 0x4) != 0 && hSize == wSize;
   bool flipX = (symmetry & 0x2) != 0;
   bool flipY = (symmetry & 0x1) != 0;
