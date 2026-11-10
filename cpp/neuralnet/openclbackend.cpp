@@ -1029,11 +1029,29 @@ struct ConvWorkspaceEltsNeeded {
 
 //--------------------------------------------------------------
 
+//A batchnorm that is exactly the identity transform (ones scale, zeros bias, IDENTITY
+//activation). LZ-style prenorm blocks are built this way; running such a kernel is a
+//no-op pass over the tensor, so NormActConv skips it entirely.
+static bool batchNormIsExactIdentity(const BatchNormLayerDesc* desc, int activation) {
+  if(activation != ACTIVATION_IDENTITY)
+    return false;
+  for(float v : desc->mergedScale) {
+    if(v != 1.0f)
+      return false;
+  }
+  for(float v : desc->mergedBias) {
+    if(v != 0.0f)
+      return false;
+  }
+  return true;
+}
+
 struct BatchNormLayer {
   const string name;
   const int numChannels;
   const float epsilon;
   const int activation;
+  const bool isIdentityBN;
 
   const int paddedNNXYLen;
   cl_mem mergedScaleBuf;
@@ -1052,6 +1070,7 @@ struct BatchNormLayer {
     numChannels(desc->numChannels),
     epsilon(desc->epsilon),
     activation(actDesc->activation),
+    isIdentityBN(batchNormIsExactIdentity(desc,actDesc->activation)),
     paddedNNXYLen(handle->paddedNNXYLen)
   {
     testAssert(desc->mean.size() == numChannels);
@@ -1792,7 +1811,11 @@ struct NormActConv {
   ) const {
     //The fused kernels always include an activation. LZ-style postnorm blocks use BN with
     //ACTIVATION_IDENTITY before the conv, so fall back to separate BN and conv in that case.
-    if(conv.canApplyWithBNAct() && norm.activation != ACTIVATION_IDENTITY)
+    //If the BN is exactly the identity, skip it altogether: those inputs are produced by
+    //masked BN/activation layers, so padding is already zero and the mask pass is a no-op.
+    if(norm.isIdentityBN)
+      conv.apply(handle,batchSize,input,output,convWorkspace,convWorkspace2);
+    else if(conv.canApplyWithBNAct() && norm.activation != ACTIVATION_IDENTITY)
       conv.applyWithBNAct(handle,&norm,batchSize,input,output,mask,convWorkspace,convWorkspace2);
     else {
       norm.apply(handle,batchSize,input,inputScratchOrInput,mask);

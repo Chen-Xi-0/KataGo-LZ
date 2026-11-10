@@ -704,9 +704,27 @@ struct ConvLayer {
 
 //--------------------------------------------------------------
 
+//A batchnorm that is exactly the identity transform (ones scale, zeros bias, IDENTITY
+//activation). LZ-style prenorm blocks are built this way; running such a layer is a
+//no-op pass over the tensor, so NormActConv skips it entirely.
+static bool batchNormIsExactIdentity(const BatchNormLayerDesc& desc, int activation) {
+  if(activation != ACTIVATION_IDENTITY)
+    return false;
+  for(float v : desc.mergedScale) {
+    if(v != 1.0f)
+      return false;
+  }
+  for(float v : desc.mergedBias) {
+    if(v != 0.0f)
+      return false;
+  }
+  return true;
+}
+
 struct BatchNormLayer {
   const string name;
   const int activation;
+  const bool isIdentityBN;
 
   vector<float> mergedScale;
   vector<float> mergedBias;
@@ -720,7 +738,8 @@ struct BatchNormLayer {
     const ActivationLayerDesc& actDesc
   ) :
     name(desc.name),
-    activation(actDesc.activation)
+    activation(actDesc.activation),
+    isIdentityBN(batchNormIsExactIdentity(desc,actDesc.activation))
   {
     int numChannels = desc.numChannels;
 
@@ -1073,8 +1092,15 @@ struct NormActConv {
     float* convWorkspace,
     bool accumulate
   ) const {
-    norm.apply(input, inputScratch, mask);
-    conv.apply(handle, inputScratch, output, convWorkspace, accumulate);
+    //If the BN is exactly the identity (LZ prenorm blocks), skip it: the inputs are
+    //produced by masked BN/activation layers, so padding is already zero and the mask
+    //pass would be a no-op.
+    if(norm.isIdentityBN)
+      conv.apply(handle, input, output, convWorkspace, accumulate);
+    else {
+      norm.apply(input, inputScratch, mask);
+      conv.apply(handle, inputScratch, output, convWorkspace, accumulate);
+    }
   }
 };
 
