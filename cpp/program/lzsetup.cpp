@@ -1,5 +1,8 @@
 #include "../program/lzsetup.h"
 
+#include <map>
+#include <ghc/filesystem.hpp>
+
 #include "../core/fileutils.h"
 #include "../core/global.h"
 #include "../neuralnet/lzconverter.h"
@@ -7,12 +10,39 @@
 
 using namespace std;
 
+namespace gfs = ghc::filesystem;
+
 namespace LzSetup {
 
 bool isLZWeightFile(const string& fileName) {
   string lower = Global::toLower(fileName);
   if(Global::isSuffix(lower,".onnx") || Global::isSuffix(lower,".onnx.gz"))
     return false;
+
+  //The sniff decompresses the whole file and hashes it, while looksLikeLZ reads only the
+  //first lines, and startup calls this more than once. Cache the verdict per
+  //(path,size,mtime) and recompute only when the file on disk actually changed.
+  //Setup is single-threaded, so the map needs no lock.
+  static std::map<string,bool> verdictCache;
+  string cacheKey;
+  bool haveKey = false;
+  try {
+    gfs::path path(fileName);
+    int64_t size = (int64_t)gfs::file_size(path);
+    int64_t mtime = (int64_t)gfs::last_write_time(path).time_since_epoch().count();
+    cacheKey = fileName + "|" + to_string(size) + "|" + to_string(mtime);
+    haveKey = true;
+  }
+  catch(const std::exception&) {
+    //Unreadable file: fall through, the sniff below will fail the same way.
+  }
+  if(haveKey) {
+    auto it = verdictCache.find(cacheKey);
+    if(it != verdictCache.end())
+      return it->second;
+  }
+
+  bool result = false;
   try {
     string uncompressed;
     string sha256Buf;
@@ -25,11 +55,14 @@ bool isLZWeightFile(const string& fileName) {
     //Only plain text candidates are LZ (.bin/.bin.gz are binary KataGo floats).
     if(Global::isSuffix(lower,".bin") || Global::isSuffix(lower,".bin.gz"))
       return false;
-    return LZConverter::looksLikeLZ(uncompressed);
+    result = LZConverter::looksLikeLZ(uncompressed);
   }
   catch(const std::exception&) {
-    return false;
+    result = false;
   }
+  if(haveKey)
+    verdictCache[cacheKey] = result;
+  return result;
 }
 
 void loadLzLadderParams(ConfigParser& cfg) {
