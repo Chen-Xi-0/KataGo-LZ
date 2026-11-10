@@ -78,6 +78,30 @@ string OpenCLKernels::common = R"%%(
   #define STORE(__buf,__x,__y) ((__buf)[(__x)] = (__y))
 #endif
 
+//Mish is x * tanh(softplus(x)). Writing u = exp(z), tanh(log1p(u)) is exactly
+//(u*u + 2u) / (u*u + 2u + 2), so one exp and one divide replace exp, log1p, and tanh
+//(the same identity as mishTanhSoftplus in cudaandrocmhelpers.inc). Splitting at
+//z == 0 keeps every exp() argument nonpositive, so the square cannot overflow even
+//if a caller ever passes an unclamped scale-8 argument.
+inline float mishTanhSoftplusSplit(float z) {
+  if(z >= 0.0f) {
+    float q = exp(-z);
+    float d = (1.0f + 2.0f*q) + 2.0f*q*q;
+    return (1.0f + 2.0f*q) / d;
+  }
+  else {
+    float u = exp(z);
+    float t = u*u + 2.0f*u;
+    return t / (t + 2.0f);
+  }
+}
+inline float mishf(float a) {
+  return a < LOG1PEXPTHRESHOLD ? a * mishTanhSoftplusSplit(a) : a;
+}
+inline float mishf_scale8(float a) {
+  return a < (LOG1PEXPTHRESHOLD*0.125f) ? a * mishTanhSoftplusSplit(a*8.0f) : a;
+}
+
 )%%";
 
 string OpenCLKernels::conv2dNCHW = OpenCLKernels::common + R"%%(
@@ -459,10 +483,10 @@ __kernel void bnActTransform(
         value = fmax(INPUT(nic,xy) * LOAD(scale,ic) + LOAD(bias,ic), ZERO) * LOAD(mask, n * xyStride + xy);
 #elif ACTIVATION == 2
         float a = INPUT(nic,xy) * LOAD(scale,ic) + LOAD(bias,ic);
-        value = floatToReal(a * tanh(a < LOG1PEXPTHRESHOLD ? log1p(exp(a)) : a)) * LOAD(mask, n * xyStride + xy);
+        value = floatToReal(mishf(a)) * LOAD(mask, n * xyStride + xy);
 #elif ACTIVATION == 12
         float a = INPUT(nic,xy) * LOAD(scale,ic) + LOAD(bias,ic);
-        value = floatToReal(a < (LOG1PEXPTHRESHOLD*0.125f) ? a * tanh(log1p(exp(a*8.0f))) : a) * LOAD(mask, n * xyStride + xy);
+        value = floatToReal(mishf_scale8(a)) * LOAD(mask, n * xyStride + xy);
 #elif ACTIVATION == 3
         float a = INPUT(nic,xy) * LOAD(scale,ic) + LOAD(bias,ic);
         value = floatToReal(a / (1.0f + exp(-a))) * LOAD(mask, n * xyStride + xy);
@@ -769,10 +793,10 @@ __kernel void scaleBiasMaskActNCHW(
       real result = fmax(LOAD(input,idx) * LOAD(scale,c) + LOAD(bias,c), ZERO) * LOAD(mask,n * xySize + xy);
 #elif ACTIVATION == 2
       float a = LOAD(input,idx) * LOAD(scale,c) + LOAD(bias,c);
-      real result = floatToReal(a * tanh(a < LOG1PEXPTHRESHOLD ? log1p(exp(a)) : a)) * LOAD(mask,n * xySize + xy);
+      real result = floatToReal(mishf(a)) * LOAD(mask,n * xySize + xy);
 #elif ACTIVATION == 12
       float a = LOAD(input,idx) * LOAD(scale,c) + LOAD(bias,c);
-      real result = floatToReal(a < (LOG1PEXPTHRESHOLD*0.125f) ? a * tanh(log1p(exp(a*8.0f))) : a) * LOAD(mask,n * xySize + xy);
+      real result = floatToReal(mishf_scale8(a)) * LOAD(mask,n * xySize + xy);
 #elif ACTIVATION == 3
       float a = LOAD(input,idx) * LOAD(scale,c) + LOAD(bias,c);
       real result = floatToReal(a / (1.0f + exp(-a))) * LOAD(mask,n * xySize + xy);
@@ -1113,10 +1137,10 @@ __kernel void addCBiasesNCAct(
     accum[n * cSize + c] = fmax(accum[n * cSize + c] + biases[c], 0.0f);
 #elif ACTIVATION == 2
     float a = accum[n * cSize + c] + biases[c];
-    accum[n * cSize + c] = floatToReal(a * tanh(a < LOG1PEXPTHRESHOLD ? log1p(exp(a)) : a));
+    accum[n * cSize + c] = floatToReal(mishf(a));
 #elif ACTIVATION == 12
     float a = accum[n * cSize + c] + biases[c];
-    accum[n * cSize + c] = floatToReal(a < (LOG1PEXPTHRESHOLD*0.125f) ? a * tanh(log1p(exp(a*8.0f))) : a);
+    accum[n * cSize + c] = floatToReal(mishf_scale8(a));
 #elif ACTIVATION == 3
     float a = accum[n * cSize + c] + biases[c];
     accum[n * cSize + c] = a / (1.0f + exp(-a));
