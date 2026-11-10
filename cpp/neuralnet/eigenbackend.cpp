@@ -704,6 +704,26 @@ struct ConvLayer {
 
 //--------------------------------------------------------------
 
+//Mish is x * tanh(softplus(x)). Writing u = exp(z), tanh(log1p(u)) is exactly
+//(u*u + 2u) / (u*u + 2u + 2), so one exp and one divide replace exp, log1p, and tanh
+//(the same identity as mishTanhSoftplus in cudaandrocmhelpers.inc). Splitting at
+//z == 0 keeps every exp() argument nonpositive, so the square cannot overflow even
+//for the scale-8 variant.
+static float mishTanhSoftplusSplit(float z) {
+  if(z >= 0.0f) {
+    float q = std::exp(-z);
+    float d = (1.0f + 2.0f*q) + 2.0f*q*q;
+    return (1.0f + 2.0f*q) / d;
+  }
+  float u = std::exp(z);
+  float t = u*u + 2.0f*u;
+  return t / (t + 2.0f);
+}
+
+static float mishElem(float a) {
+  return a < 20.0f ? a * mishTanhSoftplusSplit(a) : a;
+}
+
 //A batchnorm that is exactly the identity transform (ones scale, zeros bias, IDENTITY
 //activation). LZ-style prenorm blocks are built this way; running such a layer is a
 //no-op pass over the tensor, so NormActConv skips it entirely.
@@ -770,7 +790,7 @@ struct BatchNormLayer {
     else if(activation == ACTIVATION_RELU)
       output->chip(c, 0) = (*mask == 1.0f).select(x.cwiseMax(0.0f), z);
     else if(activation == ACTIVATION_MISH)
-      output->chip(c, 0) = (*mask == 1.0f).select(x * (x.cwiseMin(20.0f).exp().log1p() + (x.cwiseMax(20.0f) - 20.0f)).tanh(), z);
+      output->chip(c, 0) = (*mask == 1.0f).select(x.unaryExpr(&mishElem), z);
     else if(activation == ACTIVATION_SILU)
       output->chip(c, 0) = (*mask == 1.0f).select(x / ((-x).exp() + 1.0f), z);
     else if(activation == ACTIVATION_MISH_SCALE8)
@@ -803,7 +823,7 @@ struct ActivationLayer {
     else if(activation == ACTIVATION_RELU)
       *output = input->cwiseMax(0.0f);
     else if(activation == ACTIVATION_MISH)
-      *output = (*input) * ((input->cwiseMin(20.0f)).exp().log1p() + (input->cwiseMax(20.0f) - 20.0f)).tanh();
+      *output = input->unaryExpr(&mishElem);
     else if(activation == ACTIVATION_SILU)
       *output = (*input) / ((-*input).exp() + 1.0f);
     else if(activation == ACTIVATION_MISH_SCALE8)
@@ -818,7 +838,7 @@ struct ActivationLayer {
     else if(activation == ACTIVATION_RELU)
       *output = input->cwiseMax(0.0f);
     else if(activation == ACTIVATION_MISH)
-      *output = (*input) * ((input->cwiseMin(20.0f)).exp().log1p() + (input->cwiseMax(20.0f) - 20.0f)).tanh();
+      *output = input->unaryExpr(&mishElem);
     else if(activation == ACTIVATION_SILU)
       *output = (*input) / ((-*input).exp() + 1.0f);
     else if(activation == ACTIVATION_MISH_SCALE8)
@@ -972,7 +992,7 @@ struct RMSNormLayer {
     if(activation == ACTIVATION_RELU)
       return std::max(v, 0.0f);
     if(activation == ACTIVATION_MISH)
-      return v * tanhf(v < 20.0f ? log1pf(expf(v)) : v);
+      return mishElem(v);
     if(activation == ACTIVATION_SILU)
       return v / (1.0f + expf(-v));
     return v;
