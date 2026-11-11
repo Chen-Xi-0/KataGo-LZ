@@ -22,7 +22,17 @@ void NNInputs::fillRowV8(
   assert(nnYLen <= NNPos::MAX_BOARD_LEN);
   assert(board.x_size == nnXLen);
   assert(board.y_size == nnYLen);
-  std::fill(rowBin,rowBin+NUM_FEATURES_SPATIAL_V8*nnXLen*nnYLen,false);
+  //Planes 0 and 17-18 are fully rewritten below, so in the NCHW (plane-major) layout only
+  //planes 1-16 need clearing: the stone planes are written sparsely, and planes beyond the
+  //available history may hold stale data from a previous eval on this same buffer. NHWC
+  //interleaves features per position, so it keeps the full fill.
+  if(useNHWC) {
+    std::fill(rowBin,rowBin+NUM_FEATURES_SPATIAL_V8*nnXLen*nnYLen,false);
+  }
+  else {
+    int xy = nnXLen * nnYLen;
+    std::fill(rowBin+xy,rowBin+17*xy,false);
+  }
   std::fill(rowGlobal,rowGlobal+NUM_FEATURES_GLOBAL_V8,0.0f);
 
   int xSize = board.x_size;
