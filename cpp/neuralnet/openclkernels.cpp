@@ -829,6 +829,35 @@ __kernel void addPointWise(
 }
 )%%";
 
+string OpenCLKernels::addScaleBiasMaskReluNCHW = OpenCLKernels::common + R"%%(
+//Fused residual add + batchnorm + ReLU + mask for LZ-style postnorm blocks: computes
+//fmax((accum + add) * scale[c] + bias[c], 0) * mask in exactly the arithmetic order the
+//separate addPointWise and scaleBiasMaskActNCHW kernels use, saving one full tensor pass.
+__kernel void addScaleBiasMaskReluNCHW(
+  __global realstore* accumIn,  //N, c, H, W
+  __global realstore* addIn,    //N, c, H, W
+  __global realstore* output,   //N, c, H, W, may be the same as accumIn
+  __global realstore* scale,    //c
+  __global realstore* bias,     //c
+  __global realstore* mask,     //N, H, W
+  int nSize,
+  int cSize,
+  int xySize
+) {
+  const int xy = get_global_id(0);
+  const int c = get_global_id(1);
+
+  if(c < cSize && xy < xySize) {
+    for(int n = 0; n < nSize; n++) {
+      int idx = (n * cSize + c) * xySize + xy;
+      real v = LOAD(accumIn,idx) + LOAD(addIn,idx);
+      real result = fmax(v * LOAD(scale,c) + LOAD(bias,c), ZERO) * LOAD(mask,n * xySize + xy);
+      STORE(output,idx,result);
+    }
+  }
+}
+)%%";
+
 string OpenCLKernels::policyFullSplit = OpenCLKernels::common + R"%%(
 //Split the output of a Leela-Zero-style fully-connected policy head into the policy and
 //policyPass buffers. full holds numOutChannels values per batch element: numSpatial

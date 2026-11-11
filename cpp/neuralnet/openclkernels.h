@@ -19,6 +19,7 @@ namespace OpenCLKernels {
   extern std::string winogradUntransformNCHW;
   extern std::string scaleBiasMaskActNCHW;
   extern std::string addPointWise;
+  extern std::string addScaleBiasMaskReluNCHW;
   extern std::string policyFullSplit;
   extern std::string fullMatMul;
   extern std::string matMul;

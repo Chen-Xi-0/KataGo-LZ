@@ -173,6 +173,7 @@ struct CompiledPrograms {
   CLProgram transformerApplyRoPEProgram;
   CLProgram transformerSwiGLUProgram;
   CLProgram addPointWiseProgram;
+  CLProgram addScaleBiasMaskReluNCHWProgram;
   CLProgram policyFullSplitProgram;
   CLProgram fullMatMulProgram;
   CLProgram sumChannelsNCHWProgram;
@@ -310,6 +311,10 @@ struct CompiledPrograms {
     );
     addPointWiseProgram = compileProgram(
       "addPointWiseProgram", context, deviceIdsToUse, OpenCLKernels::addPointWise,
+      tuneParams.pointWise.compileOptions() + " " + maybeFP16CompileOptions
+    );
+    addScaleBiasMaskReluNCHWProgram = compileProgram(
+      "addScaleBiasMaskReluNCHWProgram", context, deviceIdsToUse, OpenCLKernels::addScaleBiasMaskReluNCHW,
       tuneParams.pointWise.compileOptions() + " " + maybeFP16CompileOptions
     );
     policyFullSplitProgram = compileProgram(
@@ -607,6 +612,7 @@ struct ComputeHandleInternal {
   CLKernel transformerApplyRoPEKernel;
   CLKernel transformerSwiGLUKernel;
   CLKernel addPointWiseKernel;
+  CLKernel addScaleBiasMaskReluNCHWKernel;
   CLKernel policyFullSplitKernel;
   CLKernel fullMatMulKernel;
   CLKernel sumChannelsNCHWKernel;
@@ -712,6 +718,8 @@ struct ComputeHandleInternal {
     transformerSwiGLUKernel = clCreateKernel(progs->transformerSwiGLUProgram, "transformerSwiGLU", &err);
     CHECK_ERR(err);
     addPointWiseKernel = clCreateKernel(progs->addPointWiseProgram, "addPointWise", &err);
+    CHECK_ERR(err);
+    addScaleBiasMaskReluNCHWKernel = clCreateKernel(progs->addScaleBiasMaskReluNCHWProgram, "addScaleBiasMaskReluNCHW", &err);
     CHECK_ERR(err);
     policyFullSplitKernel = clCreateKernel(progs->policyFullSplitProgram, "policyFullSplit", &err);
     CHECK_ERR(err);
@@ -1135,6 +1143,34 @@ struct BatchNormLayer {
   BatchNormLayer(const BatchNormLayer&) = delete;
   BatchNormLayer& operator=(const BatchNormLayer&) = delete;
 };
+
+//Fused residual add + batchnorm + ReLU + mask for LZ-style postnorm blocks (see the
+//addScaleBiasMaskReluNCHW kernel): one pass replaces addPointWise + postBN->apply.
+static void addScaleBiasMaskReluNCHW(
+  ComputeHandleInternal* handle, cl_mem accumIn, cl_mem addIn, cl_mem output,
+  const std::unique_ptr<BatchNormLayer>& bnLayer, cl_mem mask, int batchSize
+) {
+  cl_kernel kernel = handle->addScaleBiasMaskReluNCHWKernel;
+  clSetKernelArg(kernel, 0, sizeof(cl_mem), (const void *)&accumIn);
+  clSetKernelArg(kernel, 1, sizeof(cl_mem), (const void *)&addIn);
+  clSetKernelArg(kernel, 2, sizeof(cl_mem), (const void *)&output);
+  clSetKernelArg(kernel, 3, sizeof(cl_mem), (const void *)&bnLayer->mergedScaleBuf);
+  clSetKernelArg(kernel, 4, sizeof(cl_mem), (const void *)&bnLayer->mergedBiasBuf);
+  clSetKernelArg(kernel, 5, sizeof(cl_mem), (const void *)&mask);
+  clSetKernelArg(kernel, 6, sizeof(int), (const void *)&batchSize);
+  clSetKernelArg(kernel, 7, sizeof(int), (const void *)&bnLayer->numChannels);
+  clSetKernelArg(kernel, 8, sizeof(int), (const void *)&handle->paddedNNXYLen);
+
+  cl_int err;
+  size_t globalSizes[2] = {powerOf2ify((size_t)handle->paddedNNXYLen), powerOf2ify((size_t)bnLayer->numChannels)};
+  MAYBE_EVENT;
+  err = clEnqueueNDRangeKernel(
+    handle->commandQueue, kernel, 2, NULL, globalSizes, NULL, 0, NULL, MAYBE_EVENTREF
+  );
+  CHECK_ERR(err);
+  MAYBE_PROFILE("AddScaleBiasMaskReluNCHW");
+  MAYBE_FREE_EVENT;
+}
 
 //--------------------------------------------------------------
 
@@ -1880,10 +1916,16 @@ struct ResidualBlock {
     SizedBuf<cl_mem> mid(scratch->allocator, scratch->getBufSizeXY(normActConv1.outChannels));
     normActConv1.apply(handle,batchSize,trunk,trunkScratch,mid.buf,mask,convWorkspace,convWorkspace2);
     normActConv2.apply(handle,batchSize,mid.buf,mid.buf,trunkScratch,mask,convWorkspace,convWorkspace2);
-    addPointWise(handle, trunk, trunkScratch, checkedTotalElts(batchSize, normActConv2.outChannels, paddedNNXYLen, "OpenCL addPointWise"));
-    //Leela-Zero-style post-norm residual: batch norm + activation on the trunk flow itself.
-    if(hasPostNorm)
-      postBN->apply(handle,batchSize,trunk,trunk,mask);
+    //LZ-style postnorm residual: fuse the residual add with the following batchnorm +
+    //ReLU + mask into one pass, in exactly the arithmetic order of the separate kernels.
+    if(hasPostNorm && postBN->activation == ACTIVATION_RELU)
+      addScaleBiasMaskReluNCHW(handle, trunk, trunkScratch, trunk, postBN, mask, batchSize);
+    else {
+      addPointWise(handle, trunk, trunkScratch, checkedTotalElts(batchSize, normActConv2.outChannels, paddedNNXYLen, "OpenCL addPointWise"));
+      //Leela-Zero-style post-norm residual: batch norm + activation on the trunk flow itself.
+      if(hasPostNorm)
+        postBN->apply(handle,batchSize,trunk,trunk,mask);
+    }
   }
 
   ResidualBlock() = delete;
