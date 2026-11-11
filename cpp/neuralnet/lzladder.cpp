@@ -206,6 +206,26 @@ void applyLZLadderCorrectionV5(
   //Ko makes the ladder verdict unreliable; skip the surgery.
   if(board.ko_loc != Board::NULL_LOC)
     return;
+  //Gate: every action of the surgery requires some chain with at most three liberties on
+  //the current board. The candidate loop's own precheck only passes moves adjacent to a
+  //<=3 liberty group (the move itself may reduce the group's liberties or capture), and
+  //the rescue boost only fires from own one-liberty chains, so with no such chain the
+  //whole surgery is provably a no-op. Skip it: this saves the softmax denominator, the
+  //rescue scan, and the per-candidate board copies and solver calls on ordinary positions.
+  {
+    bool anyNearAtariChain = false;
+    for(int y = 0; y < board.y_size && !anyNearAtariChain; y++) {
+      for(int x = 0; x < board.x_size; x++) {
+        Loc loc = Location::getLoc(x,y,board.x_size);
+        if(board.colors[loc] != C_EMPTY && board.getNumLiberties(loc) <= 3) {
+          anyNearAtariChain = true;
+          break;
+        }
+      }
+    }
+    if(!anyNearAtariChain)
+      return;
+  }
   //Original softmax denominator over legal moves, used by the winrate nudges.
   float sumExp = 0.0f;
   for(int pos = 0; pos<policySize; pos++) {
