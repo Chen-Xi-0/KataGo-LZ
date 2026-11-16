@@ -724,6 +724,89 @@ static float mishElem(float a) {
   return a < 20.0f ? a * mishTanhSoftplusSplit(a) : a;
 }
 
+//Vectorized MISH. The scalar fallback delegates to mishElem so non-packet builds stay
+//bit-identical; the packet path rewrites both branches of mishTanhSoftplusSplit with a
+//single exp(-|a|) (its argument is always nonpositive, so no overflow) and one divide.
+//pexp is Eigen's own Cephes approximation, so results are not bit-identical to std::exp;
+//this is an "allowed reordering" optimization validated by raw-nn diffs (see
+//05_验证输出/O5_Eigen_packet化Mish_实施设计_20261116.md).
+//Eigen 3.3.7 has no generic pselect/pcmp_lt, so the two selects are built from the
+//architecture's own compare/blend intrinsics; only x86 SSE/AVX get hand-written
+//overloads, everything else uses the lane-wise fallback below.
+#ifdef EIGEN_VECTORIZE_SSE
+static inline Eigen::internal::Packet4f mishPacket4f(const Eigen::internal::Packet4f& a) {
+  using namespace Eigen::internal;
+  typedef Packet4f P;
+  P one = pset1<P>(1.0f);
+  P two = pset1<P>(2.0f);
+  P q = pexp(psub(pset1<P>(0.0f), pabs(a)));
+  P q2 = pmul(q,q);
+  P posNum = padd(one, pmul(two,q));
+  P posDen = padd(posNum, pmul(two,q2));
+  P negNum = padd(q2, pmul(two,q));
+  P negDen = padd(negNum, two);
+  P neg = _mm_cmplt_ps(a, pset1<P>(0.0f));
+  P num = _mm_or_ps(_mm_and_ps(neg, negNum), _mm_andnot_ps(neg, posNum));
+  P den = _mm_or_ps(_mm_and_ps(neg, negDen), _mm_andnot_ps(neg, posDen));
+  P r = pdiv(num, den);
+  P lt20 = _mm_cmplt_ps(a, pset1<P>(20.0f));
+  return _mm_or_ps(_mm_and_ps(lt20, pmul(a,r)), _mm_andnot_ps(lt20, a));
+}
+#endif
+#ifdef EIGEN_VECTORIZE_AVX
+static inline Eigen::internal::Packet8f mishPacket8f(const Eigen::internal::Packet8f& a) {
+  using namespace Eigen::internal;
+  typedef Packet8f P;
+  P one = pset1<P>(1.0f);
+  P two = pset1<P>(2.0f);
+  P q = pexp(psub(pset1<P>(0.0f), pabs(a)));
+  P q2 = pmul(q,q);
+  P posNum = padd(one, pmul(two,q));
+  P posDen = padd(posNum, pmul(two,q2));
+  P negNum = padd(q2, pmul(two,q));
+  P negDen = padd(negNum, two);
+  P neg = _mm256_cmp_ps(a, pset1<P>(0.0f), _CMP_LT_OQ);
+  P num = _mm256_blendv_ps(posNum, negNum, neg);
+  P den = _mm256_blendv_ps(posDen, negDen, neg);
+  P r = pdiv(num, den);
+  P lt20 = _mm256_cmp_ps(a, pset1<P>(20.0f), _CMP_LT_OQ);
+  return _mm256_blendv_ps(a, pmul(a,r), lt20);
+}
+#endif
+
+struct MishElemOp {
+  inline float operator()(float a) const { return mishElem(a); }
+#ifdef EIGEN_VECTORIZE_SSE
+  inline Eigen::internal::Packet4f packetOp(const Eigen::internal::Packet4f& a) const {
+    return mishPacket4f(a);
+  }
+#endif
+#ifdef EIGEN_VECTORIZE_AVX
+  inline Eigen::internal::Packet8f packetOp(const Eigen::internal::Packet8f& a) const {
+    return mishPacket8f(a);
+  }
+#endif
+  template <typename Packet>
+  inline Packet packetOp(const Packet& a) const {
+    typedef typename Eigen::internal::unpacket_traits<Packet>::type ScalarT;
+    enum { N = Eigen::internal::unpacket_traits<Packet>::size };
+    ScalarT lanes[N];
+    Eigen::internal::pstore(lanes, a);
+    for(int i = 0; i < (int)N; i++)
+      lanes[i] = (ScalarT)mishElem((float)lanes[i]);
+    return Eigen::internal::pload<Packet>(lanes);
+  }
+};
+
+namespace Eigen {
+namespace internal {
+template<> struct functor_traits<MishElemOp> {
+  enum { Cost = 40, PacketAccess = packet_traits<float>::HasExp };
+};
+}
+}
+
+
 //A batchnorm that is exactly the identity transform (ones scale, zeros bias, IDENTITY
 //activation). LZ-style prenorm blocks are built this way; running such a layer is a
 //no-op pass over the tensor, so NormActConv skips it entirely.
@@ -790,7 +873,7 @@ struct BatchNormLayer {
     else if(activation == ACTIVATION_RELU)
       output->chip(c, 0) = (*mask == 1.0f).select(x.cwiseMax(0.0f), z);
     else if(activation == ACTIVATION_MISH)
-      output->chip(c, 0) = (*mask == 1.0f).select(x.unaryExpr(&mishElem), z);
+      output->chip(c, 0) = (*mask == 1.0f).select(x.unaryExpr(MishElemOp()), z);
     else if(activation == ACTIVATION_SILU)
       output->chip(c, 0) = (*mask == 1.0f).select(x / ((-x).exp() + 1.0f), z);
     else if(activation == ACTIVATION_MISH_SCALE8)
@@ -823,7 +906,7 @@ struct ActivationLayer {
     else if(activation == ACTIVATION_RELU)
       *output = input->cwiseMax(0.0f);
     else if(activation == ACTIVATION_MISH)
-      *output = input->unaryExpr(&mishElem);
+      *output = input->unaryExpr(MishElemOp());
     else if(activation == ACTIVATION_SILU)
       *output = (*input) / ((-*input).exp() + 1.0f);
     else if(activation == ACTIVATION_MISH_SCALE8)
@@ -838,7 +921,7 @@ struct ActivationLayer {
     else if(activation == ACTIVATION_RELU)
       *output = input->cwiseMax(0.0f);
     else if(activation == ACTIVATION_MISH)
-      *output = input->unaryExpr(&mishElem);
+      *output = input->unaryExpr(MishElemOp());
     else if(activation == ACTIVATION_SILU)
       *output = (*input) / ((-*input).exp() + 1.0f);
     else if(activation == ACTIVATION_MISH_SCALE8)
