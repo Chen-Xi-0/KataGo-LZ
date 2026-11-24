@@ -64,17 +64,7 @@ void NNInputs::fillRowV8(
   //Planes beyond the available history are zero-filled (LZ's gather_features).
   //KataGo y runs top-to-bottom while LZ planes index bottom-to-top, so board point (x,y)
   //is written at NN position (x, y_size-1-y); converted policy rows are y-flipped to match.
-  //V8 history planes honor maxHistory, mirroring the V7 rule in nninputs.cpp
-  //(maxTurnsOfHistoryToInclude = min(available, maxHistory)). Plane h=0 is the
-  //current board and h=1.. are past boards, so the number of visible planes is
-  //min(past+1, maxHistory+1, 8). With ignorePreRootHistory, analysis sets
-  //maxHistory=0 at the root and =search depth in-tree, hiding the pre-root local
-  //fight; genmove and raw-nn keep maxHistory=1000 and stay LZ-native/unchanged.
   int numMoves = std::min<int>((int)hist.moveHistory.size() + 1, 8);
-  if(nnInputParams.maxHistory < numMoves - 1)
-    numMoves = nnInputParams.maxHistory + 1;
-  if(numMoves < 1)
-    numMoves = 1;
   for(int h = 0; h<8; h++) {
     if(h >= numMoves)
       continue;
